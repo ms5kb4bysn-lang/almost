@@ -15,6 +15,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
+#include "unified_memory.h"
 #include "../src/arena_size.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
@@ -668,7 +669,127 @@ struct DeviceState {
         VkDeviceSize in_use = 0, peak_in_use = 0, peak_end = 0;
         VkDeviceSize use_in_use[4] = {}, use_peak[4] = {};
         std::uint64_t allocations = 0, failures = 0;
+
+        // The unified arena (LEONIDA_UNIFIED_GB with VK_EXT_external_memory_host): `buffer` is a sparse buffer over
+        // the title's unified range (rt::xmem::configure_unified), with offset == CPU address, so a console VA is the
+        // address the title itself uses. Nothing is mapped: the CPU side of a range is the title's (or the layer's own
+        // committed) memory at that address, imported and bound where it lies (unified_import).
+        bool unified = false;
+        std::uint32_t sparse_types = 0;  // the sparse buffer's memoryTypeBits
+
+        // Whether arena ranges can be written by the CPU, and where offset `va` is for the CPU.
+        bool cpu() const { return mapped != nullptr || unified; }
+        std::uint8_t* host(VkDeviceSize va) const {
+            return unified ? reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(va)) : mapped + va;
+        }
     } arena;
+
+    // Imports into the unified arena, by address (unified_import / unified_forget).
+    struct Imported {
+        VkDeviceMemory memory;
+        VkDeviceSize size;
+    };
+    std::mutex unified_mutex;
+    std::map<std::uintptr_t, Imported> imported;
+    std::uint64_t imported_bytes = 0, import_failures = 0;
+    VkDeviceMemory zero_page_memory = VK_NULL_HANDLE;
+    PFN_vkGetMemoryHostPointerPropertiesEXT host_pointer_properties = nullptr;
+
+    // Binds `memory` (null: unbinds) at [address, address + size) of the unified arena and waits for it, so the next
+    // submission sees it. Synchronous: the queue goes idle (bring-up; the title maps pages at load, not per frame).
+    bool unified_bind(std::uintptr_t address, VkDeviceSize size, VkDeviceMemory bound) {
+        auto& vk = context->vk;
+        VkSparseMemoryBind bind{address, size, bound, 0, 0};
+        const VkSparseBufferMemoryBindInfo buffer_bind{arena.buffer, 1, &bind};
+        VkBindSparseInfo info_bind{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+        info_bind.bufferBindCount = 1;
+        info_bind.pBufferBinds = &buffer_bind;
+        std::lock_guard lock(context->submit_mutex());
+        if (!bound) vk.vkDeviceWaitIdle(info.device);  // nothing in flight may still read what goes away
+        return vk.vkQueueBindSparse(info.queue, 1, &info_bind, VK_NULL_HANDLE) == VK_SUCCESS &&
+               vk.vkQueueWaitIdle(info.queue) == VK_SUCCESS;
+    }
+
+    // Device memory over the host memory at [pointer, pointer + bytes) (VK_EXT_external_memory_host), allocated for
+    // device addresses; null on failure, with the host pointer's memory types in *types.
+    VkDeviceMemory import_host(void* pointer, std::size_t bytes, std::uint32_t* types) {
+        auto& vk = context->vk;
+        VkMemoryHostPointerPropertiesEXT properties{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+        if (types) *types = 0;
+        if (host_pointer_properties(info.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, pointer,
+                                    &properties) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+        if (types) *types = properties.memoryTypeBits;
+        // A type both the host pointer and the sparse buffer allow. NVIDIA's sparse buffers list only its device-local
+        // type (0x2 on the RTX 4070 Laptop, 621.24) and its host pointers 0xc: no overlap. Its driver binds and reads a
+        // host-pointer type in a sparse buffer correctly all the same (vk_host_import_probe, sections C/D), so that
+        // is used, outside VkSparseMemoryBind's valid usage (memory type in the resource's memoryTypeBits):
+        // experimental, said once.
+        std::uint32_t bits = properties.memoryTypeBits & arena.sparse_types;
+        if (!bits) {
+            bits = properties.memoryTypeBits;
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr,
+                             "[rt] d3d12: unified arena: host memory types 0x%x are not among the sparse buffer's "
+                             "0x%x; binding them anyway (outside the Vulkan valid usage; measured to work on NVIDIA)\n",
+                             properties.memoryTypeBits, arena.sparse_types);
+        }
+        std::uint32_t type = UINT32_MAX;
+        for (std::uint32_t i = 0; i < 32 && type == UINT32_MAX; ++i)
+            if (bits & (1u << i)) type = i;
+        if (type == UINT32_MAX) return VK_NULL_HANDLE;
+        VkImportMemoryHostPointerInfoEXT host{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+        host.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        host.pHostPointer = pointer;
+        // The arena is addressed by device address, so what is bound to it must be allocated for that.
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &host};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+        allocate.allocationSize = bytes;
+        allocate.memoryTypeIndex = type;
+        VkDeviceMemory memory_out = VK_NULL_HANDLE;
+        return vk.vkAllocateMemory(info.device, &allocate, nullptr, &memory_out) == VK_SUCCESS ? memory_out
+                                                                                                : VK_NULL_HANDLE;
+    }
+
+    // Imports the title's memory at [address, address + size) (64 KiB-aligned, committed or a mapped page) and binds
+    // it at the same offset of the arena. Large commits go in pieces of at most 1 GiB (Intel refuses single imports
+    // of 4 GiB, vk_host_import_probe --sizes).
+    void unified_import(std::uintptr_t address, std::size_t size) {
+        if (!arena.unified || !host_pointer_properties || address + size > arena.size) return;
+        std::lock_guard lock(unified_mutex);
+        constexpr std::size_t kPiece = std::size_t{1} << 30;
+        for (std::size_t done = 0; done < size;) {
+            const std::uintptr_t at = address + done;
+            const std::size_t bytes = std::min(kPiece, size - done);
+            done += bytes;
+            if (imported.count(at)) continue;
+            std::uint32_t types = 0;
+            const VkDeviceMemory imported_memory = import_host(reinterpret_cast<void*>(at), bytes, &types);
+            if (!imported_memory || !unified_bind(at, bytes, imported_memory)) {
+                if (imported_memory) context->vk.vkFreeMemory(info.device, imported_memory, nullptr);
+                if (import_failures++ < 16)
+                    std::fprintf(stderr, "[rt] d3d12: unified arena: 0x%llx + 0x%llx not imported (memory types 0x%x)\n",
+                                 static_cast<unsigned long long>(at), static_cast<unsigned long long>(bytes), types);
+                continue;
+            }
+            imported[at] = Imported{imported_memory, bytes};
+            imported_bytes += bytes;
+        }
+    }
+
+    // Unbinds and frees the imports inside [address, address + size).
+    void unified_forget(std::uintptr_t address, std::size_t size) {
+        if (!arena.unified) return;
+        std::lock_guard lock(unified_mutex);
+        for (auto it = imported.lower_bound(address); it != imported.end() && it->first < address + size;) {
+            unified_bind(it->first, it->second.size, VK_NULL_HANDLE);
+            context->vk.vkFreeMemory(info.device, it->second.memory, nullptr);
+            imported_bytes -= it->second.size;
+            it = imported.erase(it);
+        }
+    }
 
     std::uint32_t sparse_buffer_memory_types = 0;
     bool sparse_image_tiles = false;
@@ -700,6 +821,30 @@ struct DeviceState {
     // with that range's free entry. The fit test cannot wrap: free blocks lie inside the arena (below 4 GiB).
     bool arena_allocate(VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& out, ArenaUse use) {
         if (!bytes || bytes > arena.size) return false;
+        if (arena.unified) {
+            // Committed memory carved from the unified range: the xmem observer imports and binds it (with the
+            // arena mutex not held, so the callback cannot wait on it), and offset == address. Descriptor heaps take
+            // their place below 4 GiB, where the shaders' 32-bit table pointers reach (section 3.3).
+            (void)use;
+            void* const block = rt::unified::api.commit(std::size_t(bytes), std::size_t(alignment));
+            if (!block) {
+                std::lock_guard lock(arena.mutex);
+                ++arena.failures;
+                return false;
+            }
+            out = reinterpret_cast<std::uintptr_t>(block);
+            std::lock_guard lock(arena.mutex);
+            ++arena.allocations;
+            arena.in_use += bytes;
+            arena.peak_in_use = std::max(arena.peak_in_use, arena.in_use);
+            arena.peak_end = std::max(arena.peak_end, out + bytes);
+            arena.use_in_use[use] += bytes;
+            arena.use_peak[use] = std::max(arena.use_peak[use], arena.use_in_use[use]);
+            if (arena.log)
+                std::fprintf(stderr, "[rt] d3d12: arena %s VA 0x%llx + 0x%llx (unified)\n", kArenaUseNames[use],
+                             (unsigned long long)out, (unsigned long long)bytes);
+            return true;
+        }
         std::lock_guard lock(arena.mutex);
         for (auto it = arena.free.begin(); it != arena.free.end(); ++it) {
             const VkDeviceSize start = (it->first + alignment - 1) / alignment * alignment;
@@ -752,9 +897,16 @@ struct DeviceState {
 
     void arena_release(VkDeviceSize offset, VkDeviceSize bytes, ArenaUse use) {
         if (!bytes) return;
+        {
+            std::lock_guard lock(arena.mutex);
+            arena.in_use -= bytes;
+            arena.use_in_use[use] -= bytes;
+        }
+        if (arena.unified) {
+            rt::unified::api.release(reinterpret_cast<void*>(static_cast<std::uintptr_t>(offset)), std::size_t(bytes));
+            return;
+        }
         std::lock_guard lock(arena.mutex);
-        arena.in_use -= bytes;
-        arena.use_in_use[use] -= bytes;
         auto it = arena.free.emplace(offset, bytes).first;
         if (auto next = std::next(it); next != arena.free.end() && it->first + it->second == next->first) {
             it->second += next->second;
@@ -1658,14 +1810,14 @@ public:
     // default-heap buffer is not: in host memory its GPU handle would be 0, and every table would read VA 0.
     DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc) : device_(device), desc_(desc) {
         const VkDeviceSize bytes = VkDeviceSize(desc.NumDescriptors) * kDescriptorSize;
-        if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
+        if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.cpu()) {
             if (!device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
                 log_once("GPU address arena full (raise LEONIDA_ARENA_MB); shader-visible heap size in KiB:",
                          int(std::min<VkDeviceSize>(bytes / 1024, INT_MAX)));
                 return;
             }
             in_arena_ = true;
-            cpu_ = device.arena.mapped + arena_offset_;
+            cpu_ = device.arena.host(arena_offset_);
             std::memset(cpu_, 0, std::size_t(bytes));
         } else {
             storage_.reset(new std::byte[std::size_t(bytes)]());
@@ -1775,7 +1927,7 @@ public:
         const bool host = cpu_visible();
         leonida::ResourceBinding binding{};  // a buffer: no image
         binding.size = desc_.Width;
-        if (!host && device_.arena.mapped) {
+        if (!host && device_.arena.cpu()) {
             if (!device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_,
                                         DeviceState::arena_buffer)) {
                 log_once("GPU address arena full (raise LEONIDA_ARENA_MB); buffer size in KiB:",
@@ -1783,7 +1935,7 @@ public:
                 return E_OUTOFMEMORY;
             }
             in_arena_ = true;
-            std::memset(device_.arena.mapped + arena_offset_, 0, std::size_t(desc_.Width));
+            std::memset(device_.arena.host(arena_offset_), 0, std::size_t(desc_.Width));
             va_ = arena_offset_;
             binding.va = va_;
             binding.buffer = device_.arena.buffer;
@@ -1975,16 +2127,17 @@ public:
 
     // A placed buffer is a range of the heap's arena memory: it has no VkBuffer of its own and its console VA is
     // where it sits in the arena. The arena is host-visible, so an upload or readback place maps that same range.
-    HRESULT create_placed_buffer() {
-        if (!device_.arena.mapped) return E_OUTOFMEMORY;
-        if (cpu_visible()) mapped_ = device_.arena.mapped + va_;
-        std::memset(device_.arena.mapped + va_, 0, std::size_t(desc_.Width));  // a fresh place reads as zeroed
+    // `zero` is false for a buffer over memory the title already holds (device slot 133, a resource at its address).
+    HRESULT create_placed_buffer(bool zero = true) {
+        if (!device_.arena.cpu()) return E_OUTOFMEMORY;
+        if (cpu_visible()) mapped_ = device_.arena.host(va_);
+        if (zero) std::memset(device_.arena.host(va_), 0, std::size_t(desc_.Width));  // a fresh place reads as zeroed
         leonida::ResourceBinding binding{};
         binding.size = desc_.Width;
         binding.buffer = device_.arena.buffer;
         binding.buffer_offset = va_;
         binding.va = va_;
-        binding.host = cpu_writable() ? device_.arena.mapped + va_ : nullptr;
+        binding.host = cpu_writable() ? device_.arena.host(va_) : nullptr;
         binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
                                  (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
                                   heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
@@ -2590,7 +2743,7 @@ public:
 
     Heap(DeviceState& device, const D3D12_HEAP_DESC& desc) : device_(device), desc_(desc) {
         VkDeviceSize offset = 0;
-        if (device_.arena.mapped &&
+        if (device_.arena.cpu() &&
             device_.arena_allocate(desc_.SizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, offset,
                                    DeviceState::arena_heap)) {
             allocation_ = std::shared_ptr<const leonida::TileHeapAllocation>(
@@ -3187,7 +3340,7 @@ public:
         }
         if (desc.NodeMask & ~1u) return E_INVALIDARG;
         if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags) return E_INVALIDARG;
-        if (!device_.arena.mapped) {
+        if (!device_.arena.cpu()) {
             log_once("pipelines need the GPU address arena (bufferDeviceAddress); stage", 1);
             return E_NOTIMPL;
         }
@@ -3746,7 +3899,7 @@ public:
         if (code_stage) {
             VkDeviceSize offset = 0;
             if (!device_.arena_allocate(code_stage->fssm.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
-            std::memcpy(device_.arena.mapped + offset, code_stage->fssm.data(), code_stage->fssm.size());
+            std::memcpy(device_.arena.host(offset), code_stage->fssm.data(), code_stage->fssm.size());
             code_bytes_ = code_stage->fssm.size();
             code_base_ = offset;
             graphics_.code_base = offset;
@@ -3763,7 +3916,7 @@ public:
         if (!desc.CS.pShaderBytecode || !desc.CS.BytecodeLength) return E_INVALIDARG;
         if (desc.NodeMask & ~1u) return E_INVALIDARG;
         if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags) return E_INVALIDARG;
-        if (!device_.arena.mapped) {
+        if (!device_.arena.cpu()) {
             log_once("pipelines need the GPU address arena (bufferDeviceAddress); stage", 0);
             return E_NOTIMPL;
         }
@@ -3861,7 +4014,7 @@ public:
         const std::vector<std::uint8_t>& code = program.bytes;
         VkDeviceSize offset = 0;
         if (!device_.arena_allocate(code.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
-        std::memcpy(device_.arena.mapped + offset, code.data(), code.size());
+        std::memcpy(device_.arena.host(offset), code.data(), code.size());
         code_bytes_ = code.size();
         code_base_ = offset;
         pipeline_.code_base = offset;
@@ -5155,9 +5308,102 @@ public:
     // LEONIDA_ARENA_MB sets its size (default 256, at most 4095, and no more than the device's maxBufferSize and
     // maxMemoryAllocationSize allow: src/arena_size.h): it holds every default-heap buffer, shader-visible
     // descriptor heap and shader program. M0-M3 keep it host-visible (section 3.3, memory type policy).
+    // The xmem observer of the unified arena: what the title (and the layer's own arena ranges) commit or map is
+    // imported and bound at its address; unmapped pages and released blocks are unbound. Runs under xmem's lock.
+    static void unified_committed(void* context, std::uintptr_t base, std::size_t size, std::uint64_t) {
+        static_cast<DeviceState*>(context)->unified_import(base, size);
+    }
+    static void unified_page_mapped(void* context, std::uintptr_t address, void*, std::uint64_t) {
+        static_cast<DeviceState*>(context)->unified_import(address, leonida::tile_size_in_bytes);
+    }
+    static void unified_page_unmapped(void* context, std::uintptr_t address) {
+        static_cast<DeviceState*>(context)->unified_forget(address, leonida::tile_size_in_bytes);
+    }
+    static void unified_released(void* context, std::uintptr_t base, std::size_t size) {
+        static_cast<DeviceState*>(context)->unified_forget(base, size);
+    }
+
+    // The unified arena (DeviceState::Arena::unified): a sparse buffer over [0, end) of the title's unified range, a
+    // zeroed device page bound at VA 0 (the zero page; Windows never hands out the first 64 KiB), heap_base = its device
+    // address, and the xmem observer, which replays what is already committed or mapped.
+    bool create_unified_arena(std::uint64_t end) {
+        auto& vk = state_.context->vk;
+        auto& arena = state_.arena;
+        const auto device_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+            state_.info.get_instance_proc(state_.info.instance, "vkGetDeviceProcAddr"));
+        state_.host_pointer_properties = device_proc ? reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+                                                           device_proc(state_.info.device,
+                                                                       "vkGetMemoryHostPointerPropertiesEXT"))
+                                                     : nullptr;
+        if (!state_.host_pointer_properties || !vk.vkQueueBindSparse) {
+            std::fprintf(stderr, "[rt] d3d12: unified arena: no %s\n",
+                         state_.host_pointer_properties ? "vkQueueBindSparse" : "vkGetMemoryHostPointerPropertiesEXT");
+            return false;
+        }
+        VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        VkBufferCreateInfo info = state_.sparse_buffer_info(end);
+        info.pNext = &external;
+        if (state_.info.ray_tracing)
+            info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                          VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        if (const VkResult r = vk.vkCreateBuffer(state_.info.device, &info, nullptr, &arena.buffer); r != VK_SUCCESS) {
+            std::fprintf(stderr, "[rt] d3d12: unified arena: vkCreateBuffer of a %llu GiB sparse buffer: %d\n",
+                         static_cast<unsigned long long>(end >> 30), static_cast<int>(r));
+            arena.buffer = VK_NULL_HANDLE;
+            return false;
+        }
+        VkMemoryRequirements requirements{};
+        vk.vkGetBufferMemoryRequirements(state_.info.device, arena.buffer, &requirements);
+        arena.sparse_types = requirements.memoryTypeBits;
+        // The zero page at VA 0 (which the process cannot map): a committed, zeroed host page elsewhere, imported and
+        // bound there like the title's memory, so it takes the same memory type path.
+        arena.address = 0;
+        arena.size = end;
+        arena.unified = true;
+        void* const zero = VirtualAlloc(nullptr, kArenaReserved, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);  // zeroed
+        if (zero) state_.zero_page_memory = state_.import_host(zero, kArenaReserved, nullptr);
+        if (!state_.zero_page_memory || !state_.unified_bind(0, kArenaReserved, state_.zero_page_memory)) {
+            std::fprintf(stderr, "[rt] d3d12: unified arena: the zero page could not be imported or bound (sparse "
+                         "memory types 0x%x)\n", arena.sparse_types);
+            arena.unified = false;
+            if (state_.zero_page_memory) vk.vkFreeMemory(state_.info.device, state_.zero_page_memory, nullptr);
+            state_.zero_page_memory = VK_NULL_HANDLE;
+            vk.vkDestroyBuffer(state_.info.device, arena.buffer, nullptr);
+            arena.buffer = VK_NULL_HANDLE;
+            return false;
+        }
+        VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        address.buffer = arena.buffer;
+        arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
+        arena.peak_end = kArenaReserved;
+        char log[4] = {};
+        size_t length = 0;
+        arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
+        state_.context->set_heap_base(arena.address);
+        state_.context->set_zero_page(arena.buffer, 0, kArenaReserved);
+        static const rt::xmem::MemoryObserver observer{nullptr, &unified_committed, &unified_page_mapped,
+                                                       &unified_page_unmapped, &unified_released};
+        rt::unified::api.observe(&state_, &observer);  // replays the title's commits and mapped pages
+        std::fprintf(stderr,
+                     "[rt] d3d12: unified GPU address arena: a sparse buffer over [0, %llu GiB), %.1f MiB of the "
+                     "title's memory imported at start (%llu refused)\n",
+                     static_cast<unsigned long long>(end >> 30), double(state_.imported_bytes) / (1 << 20),
+                     static_cast<unsigned long long>(state_.import_failures));
+        return true;
+    }
+
     bool create_arena() {
         auto& vk = state_.context->vk;
         if (!vk.vkGetBufferDeviceAddress) return false;
+        // LEONIDA_UNIFIED_GB (main.cpp, rt::xmem::configure_unified) with VK_EXT_external_memory_host and a buffer
+        // that large: the unified arena. Otherwise, or if it cannot be made, the ordinary one below.
+        if (const std::uint64_t end = rt::unified::range_end();
+            end && state_.info.external_memory_host && rt::unified::api.observe &&
+            (!state_.info.max_buffer_size || end <= state_.info.max_buffer_size)) {
+            if (create_unified_arena(end)) return true;
+            std::fprintf(stderr, "[rt] d3d12: the unified GPU address arena could not be made; using the ordinary one\n");
+        }
         char text[16] = {};
         size_t length = 0;
         const bool set = getenv_s(&length, text, "LEONIDA_ARENA_MB") == 0 && length > 1;
@@ -5256,6 +5502,15 @@ public:
             state_.bindless.reset();
         }
         state_.report_arena();
+        if (state_.arena.unified && rt::unified::api.observe) {
+            rt::unified::api.observe(nullptr, nullptr);  // no more imports into a buffer that is about to go
+            std::lock_guard lock(state_.unified_mutex);
+            for (const auto& [address, import] : state_.imported)
+                state_.context->vk.vkFreeMemory(state_.info.device, import.memory, nullptr);
+            state_.imported.clear();
+            if (state_.zero_page_memory)
+                state_.context->vk.vkFreeMemory(state_.info.device, state_.zero_page_memory, nullptr);
+        }
         if (state_.context && state_.arena.buffer) {
             auto& vk = state_.context->vk;
             vk.vkDestroyBuffer(state_.info.device, state_.arena.buffer, nullptr);
@@ -6790,7 +7045,7 @@ public:
             log_once((std::string("CreateHeap refused (") + why + "), heap type").c_str(), int(desc->Properties.Type));
             return E_INVALIDARG;
         }
-        if (!state_.arena.mapped) {
+        if (!state_.arena.cpu()) {
             log_once("heaps need the GPU address arena (bufferDeviceAddress); heap size in KiB:",
                      int(desc->SizeInBytes / 1024));
             return E_NOTIMPL;
@@ -6971,6 +7226,40 @@ public:
         return d3d12_trace::result(method, hand_out(resource, riid, out));
     }
 
+public:
+    // A buffer over memory the title mapped itself, at its address (Xbox device slot 133, CreatePlacedResourceX with a
+    // barrier layout; d3d12_xs_device.cpp). Only with the unified arena, where offset == address and the title's pages
+    // are already bound there (xmem observer): the resource is that range, not zeroed. A texture there is refused.
+    HRESULT create_buffer_at_address(UINT64 address, const D3D12_RESOURCE_DESC& desc, REFIID riid, void** out) {
+        constexpr auto method = "XboxDevice::CreatePlacedResourceX(address)";
+        if (out) *out = nullptr;
+        if (!state_.arena.unified) {
+            log_once("resource at a title address needs the unified arena (LEONIDA_UNIFIED_GB); refused, address",
+                     static_cast<int>(address >> 16));
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+            log_once("texture at a title address is not implemented; dimension", int(desc.Dimension));
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        if (!address || !desc.Width || address + desc.Width > state_.arena.size || address + desc.Width < address)
+            return d3d12_trace::result(method, E_INVALIDARG);
+        if (!out) return d3d12_trace::result(method, E_POINTER);
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        auto* resource = new Resource(state_, desc, heap, D3D12_HEAP_FLAG_NONE, address);
+        resource->attach_device(identity());
+        if (const HRESULT hr = resource->create_placed_buffer(false); FAILED(hr)) {
+            resource->Release();
+            return d3d12_trace::result(method, hr);
+        }
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr, "[rt] d3d12: buffer at the title's address 0x%llx + 0x%llx (unified arena)\n",
+                         static_cast<unsigned long long>(address), static_cast<unsigned long long>(desc.Width));
+        return d3d12_trace::result(method, hand_out(resource, riid, out));
+    }
+
+private:
     // Footprints for copies through a buffer: rows padded to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (512 for planar
     // depth-stencil), subresources placed at D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, block-compressed sizes rounded up to whole blocks, depth-stencil
     // formats as two planes. d3d12_vulkan_device_test compares every output with the PC runtime's.
@@ -8427,6 +8716,23 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
     return nullptr;
 }
 
+HRESULT create_buffer_at_address(ID3D12Device* device, UINT64 address, const D3D12_RESOURCE_DESC* desc, REFIID riid,
+                                 void** out) {
+    if (out) *out = nullptr;
+    if (!device || !desc) return E_INVALIDARG;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (auto* d = Device::from<Device>(real ? real : device)) return d->create_buffer_at_address(address, *desc, riid, out);
+    return E_NOTIMPL;  // a PC runtime device: no title-mapped resources
+}
+
+namespace {
+// The proxy's device slot 133 reaches create_buffer_at_address through its hook (d3d12_xs_device.h).
+const bool g_registered_create_at_address = [] {
+    rt::d3d12_xs::set_create_at_address(&create_buffer_at_address);
+    return true;
+}();
+}  // namespace
+
 bool device_supports_ray_tracing(ID3D12Device* device) {
     if (!device) return false;
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
@@ -9177,6 +9483,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     const bool has_host_image_copy = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0;
     });
+    // Optional: VK_EXT_external_memory_host, for the unified arena (no feature struct; the extension is enough).
+    info.external_memory_host = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+        return std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) == 0;
+    });
     VkPhysicalDeviceImageViewMinLodFeaturesEXT min_lod{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT};
     if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
             return std::strcmp(e.extensionName, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME) == 0;
@@ -9409,6 +9719,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
+    if (info.external_memory_host) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (info.fragment_shader_barycentric)
         device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
     if (info.fragment_shader_interlock) device_extensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);

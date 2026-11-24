@@ -35,6 +35,7 @@
 
 #include "shims.h"
 #include "startup_trace.h"
+#include "unified_memory.h"
 #include "xmem.h"
 
 namespace {
@@ -850,6 +851,32 @@ uint64_t configure_unified(uint64_t bytes) {
     return reserved;
 }
 
+void* commit_unified(size_t bytes, size_t alignment) {
+    const std::lock_guard lock(g_phys_mutex);
+    if (!g_unified_end || !bytes) return nullptr;
+    bytes = (bytes + kXmemPageSize64k - 1) & ~(static_cast<size_t>(kXmemPageSize64k) - 1);
+    alignment = alignment > kXmemPageSize64k ? alignment : kXmemPageSize64k;
+    const uintptr_t at = carve_unified(bytes, alignment);
+    if (!at) return nullptr;
+    void* const result = placeholder_api().virtual_alloc2(GetCurrentProcess(), reinterpret_cast<void*>(at), bytes,
+                                                          MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                                                          PAGE_READWRITE, nullptr, 0);
+    if (!result) return nullptr;  // the block stays a placeholder
+    note_region(at, bytes, 0, true, _ReturnAddress());
+    return result;
+}
+
+bool release_unified(void* base, size_t bytes) {
+    const std::lock_guard lock(g_phys_mutex);
+    const auto at = reinterpret_cast<uintptr_t>(base);
+    bytes = (bytes + kXmemPageSize64k - 1) & ~(static_cast<size_t>(kXmemPageSize64k) - 1);
+    if (!g_unified_end || !at || g_regions.erase(at) == 0) return false;
+    if (g_observer.released) g_observer.released(g_observer_context, at, bytes);  // unbound before the memory goes
+    if (!VirtualFree(base, 0, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) return false;
+    g_unified_free[at] = bytes;
+    return true;
+}
+
 bool unified_range(uint64_t* end) {
     const std::lock_guard lock(g_phys_mutex);
     if (end) *end = g_unified_end;
@@ -874,6 +901,17 @@ void set_memory_observer(void* context, const MemoryObserver* observer) {
 }
 
 }  // namespace rt::xmem
+
+namespace {
+// Hands the GPU layer the unified range (unified_memory.h): set before main, when xmem is linked in.
+const bool g_unified_api = [] {
+    rt::unified::api.range = &rt::xmem::unified_range;
+    rt::unified::api.commit = &rt::xmem::commit_unified;
+    rt::unified::api.release = &rt::xmem::release_unified;
+    rt::unified::api.observe = &rt::xmem::set_memory_observer;
+    return true;
+}();
+}  // namespace
 
 #define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
 

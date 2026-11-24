@@ -1799,6 +1799,24 @@ std::uint64_t proxy_struct_return(std::uint64_t rcx, std::uint64_t rdx, std::uin
     return reinterpret_cast<std::uint64_t>(out);
 }
 
+std::atomic<CreateAtAddressFn> g_create_at_address{nullptr};
+
+// Device slot 133: (address, D3D12_RESOURCE_DESC1*, barrier layout, clear value, riid, out) (game_scarlett_master.exe
+// 1.0.2.1 at exe+0x1e8684c, layout 0xffffffff = undefined; VIctory device.rs create_at_address and XCL device_x.rs
+// create_placed_resource_layout_x read the same shape). D3D12_RESOURCE_DESC1 begins with D3D12_RESOURCE_DESC; its
+// sampler feedback region is not needed. The layout is not used: a buffer has none.
+HRESULT proxy_create_at_address(DeviceProxy* self, std::uint64_t address, std::uint64_t desc, std::uint64_t riid,
+                                std::uint64_t out) {
+    note_slot(133);
+    auto** result = reinterpret_cast<void**>(out);
+    if (result) *result = nullptr;
+    if (!desc || !riid || !result) return E_INVALIDARG;
+    const CreateAtAddressFn create = g_create_at_address.load(std::memory_order_acquire);
+    if (!create) return E_NOTIMPL;
+    return create(self->real, address, reinterpret_cast<const D3D12_RESOURCE_DESC*>(desc),
+                  *reinterpret_cast<const IID*>(riid), result);
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1825,6 +1843,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                   reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35 || Slot == 45 || Slot == 46 || Slot == 50) {
         return hr_to_u64(proxy_unwrapping_call<Slot>(self, a1, a2, a3, a4, a5));
+    } else if constexpr (Slot == 133) {
+        return hr_to_u64(proxy_create_at_address(self, a1, a2, a5, a6));
     } else if constexpr (Slot == 25 || Slot == 26 || Slot == 43) {
         return proxy_struct_return<Slot>(reinterpret_cast<std::uint64_t>(self), a1, a2, a3, a4);
     } else if constexpr (Slot == 75) {
@@ -2039,6 +2059,8 @@ bool is_fence_proxy(const void* fence) { return is_child_proxy<ChildKind::fence>
 bool is_allocator_proxy(const void* allocator) { return is_child_proxy<ChildKind::allocator>(allocator); }
 
 bool is_list_proxy(const void* list) { return is_list_proxy_object(list); }
+
+void set_create_at_address(CreateAtAddressFn fn) { g_create_at_address.store(fn, std::memory_order_release); }
 
 ID3D12GraphicsCommandList* list_proxy_real_list(const void* list) {
     if (!is_list_proxy_object(list)) return nullptr;

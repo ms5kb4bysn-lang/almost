@@ -122,6 +122,10 @@ struct VulkanDeviceInfo {
     // VK_EXT_host_image_copy and its hostImageCopy feature are enabled on `device`: WriteToSubresource and
     // ReadFromSubresource on textures in CPU-visible heaps copy on the CPU instead of through a staging submit.
     bool host_image_copy = false;
+    // VK_EXT_external_memory_host is enabled on `device`: the title's own memory can be imported (vkAllocateMemory with
+    // VkImportMemoryHostPointerInfoEXT) and bound into a sparse buffer, which the unified GPU address arena does
+    // (LEONIDA_UNIFIED_GB; runtime/test/vk_host_import_probe.cpp measures it).
+    bool external_memory_host = false;
     // VK_KHR_shader_fma and its shaderFmaFloat32 feature are enabled on `device`: translated shaders built with
     // `rdna2spirv.py --fma khr` (OpFmaKHR, capability FMAKHR in the index) can be created. Without it only the
     // default `--fma glsl` shaders can.
@@ -218,6 +222,10 @@ VkBuffer vulkan_buffer(ID3D12Resource* resource);
 const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device);
 // True when `device` has VK_KHR_acceleration_structure + VK_KHR_ray_query enabled.
 bool device_supports_ray_tracing(ID3D12Device* device);
+// A buffer over memory the title mapped itself at `address` (Xbox device slot 133), on a device with the unified
+// arena (LEONIDA_UNIFIED_GB). E_NOTIMPL without it, or for a texture.
+HRESULT create_buffer_at_address(ID3D12Device* device, UINT64 address, const D3D12_RESOURCE_DESC* desc, REFIID riid,
+                                 void** out);
 // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.
 VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D3D12_GPU_VIRTUAL_ADDRESS va);
 

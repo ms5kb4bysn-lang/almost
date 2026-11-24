@@ -25,7 +25,16 @@ struct MemoryObserver {
     void (*page_mapped)(void* context, uintptr_t address, void* section, uint64_t offset);
     // The page at `address` unmapped; the address is a placeholder again.
     void (*page_unmapped)(void* context, uintptr_t address);
+    // A block from commit_unified given back with release_unified.
+    void (*released)(void* context, uintptr_t base, size_t size);
 };
+
+// Read-write memory for the GPU layer's own arena ranges, carved from the unified range like the title's, and
+// reported to the observer as committed. `bytes` and `alignment` are rounded up to 64 KiB. Null without a unified
+// range or when nothing fits.
+void* commit_unified(size_t bytes, size_t alignment);
+// Gives a commit_unified block back: it becomes a placeholder of the range again (reported as released).
+bool release_unified(void* base, size_t bytes);
 
 // The unified range: reserves the free parts of [64 KiB, `bytes`) as placeholders, and from then on every
 // XMemVirtualAlloc that lets the system choose its address is carved from them instead, so the title's GPU-visible

@@ -89,6 +89,14 @@ unsigned device_proxy_slot_count(const void* device);
 // The PC device behind a proxy. Null when `device` is not a proxy.
 ID3D12Device* device_proxy_real_device(const void* device);
 
+// Device slot 133 (CreatePlacedResourceX with a barrier layout: a resource at an address the title mapped itself) is
+// answered by the backend that registers here: the Vulkan layer, with its unified arena (rt::d3d12::
+// create_buffer_at_address). The proxy is also built without that layer (tests), so it is a hook; unset, slot 133 is
+// E_NOTIMPL.
+using CreateAtAddressFn = HRESULT (*)(ID3D12Device* real, UINT64 address, const D3D12_RESOURCE_DESC* desc,
+                                      REFIID riid, void** out);
+void set_create_at_address(CreateAtAddressFn fn);
+
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
 // 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76. Slot 10 is intentionally false: the
