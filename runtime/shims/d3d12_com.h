@@ -223,9 +223,23 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device);
 // True when `device` has VK_KHR_acceleration_structure + VK_KHR_ray_query enabled.
 bool device_supports_ray_tracing(ID3D12Device* device);
 // A buffer over memory the title mapped itself at `address` (Xbox device slot 133), on a device with the unified
-// arena (LEONIDA_UNIFIED_GB). E_NOTIMPL without it, or for a texture.
+// arena (LEONIDA_UNIFIED_GB). E_NOTIMPL without it.
 HRESULT create_buffer_at_address(ID3D12Device* device, UINT64 address, const D3D12_RESOURCE_DESC* desc, REFIID riid,
                                  void** out);
+// A texture over memory the title placed at `address` (Xbox device slot 133, CreatePlacedResourceX with a barrier
+// layout). The image is device-local and gets the console layout's bytes uploaded at creation where the layer reads
+// them (linear 2D colour, single-mip SW_4KB_S / SW_64KB_D); its T# base is the title address and
+// GetGPUVirtualAddress() answers 0. `layout` and `clear` are the console call's third and fourth arguments.
+HRESULT create_texture_at_address(ID3D12Device* device, UINT64 address, const D3D12_RESOURCE_DESC* desc,
+                                  D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* clear, REFIID riid,
+                                  void** out);
+// The resource the device holds for a texture at a title address, or null. For tests.
+ID3D12Resource* placed_texture_at_address(ID3D12Device* device, UINT64 address);
+// Xbox device slots 70/71's placed view: an SRV (`unordered` false) or UAV of the memory named by the console view
+// description's words 10-11. A texture there is the registry's, or is made at the address from `resource`. The proxy
+// registers this as its hook; tests may call it directly.
+void create_placed_view(ID3D12Device* device, bool unordered, const D3D12_RESOURCE_DESC* resource,
+                        const std::uint32_t* view, D3D12_CPU_DESCRIPTOR_HANDLE handle);
 // A descriptor heap in memory the title allocated for it at `address` (Xbox device slot 14 with a placed heap).
 HRESULT create_descriptor_heap_at(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc, UINT64 address,
                                   REFIID riid, void** out);

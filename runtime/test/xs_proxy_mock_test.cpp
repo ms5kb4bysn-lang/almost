@@ -1339,16 +1339,20 @@ struct AtAddressCall {
     ID3D12Device* real;
     UINT64 address;
     const D3D12_RESOURCE_DESC* desc;
+    D3D12_BARRIER_LAYOUT layout;
+    const D3D12_CLEAR_VALUE* clear;
     IID riid;
     Mock* made;
 } g_at_address{};
 
-HRESULT test_create_at_address(ID3D12Device* real, UINT64 address, const D3D12_RESOURCE_DESC* desc, REFIID riid,
-                               void** out) {
+HRESULT test_create_at_address(ID3D12Device* real, UINT64 address, const D3D12_RESOURCE_DESC* desc,
+                               D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) {
     ++g_at_address.calls;
     g_at_address.real = real;
     g_at_address.address = address;
     g_at_address.desc = desc;
+    g_at_address.layout = layout;
+    g_at_address.clear = clear;
     g_at_address.riid = riid;
     Mock* resource = new_mock(Kind::resource);
     g_at_address.made = resource;
@@ -1403,6 +1407,7 @@ int check_placed_hooks() {
     xs::set_create_at_address(nullptr);
     EXPECT(made == S_OK && at.calls == 1 && at.real == reinterpret_cast<ID3D12Device*>(mock) &&
            at.address == kAddress && at.desc == &desc && IsEqualIID(at.riid, kResourceIid));
+    EXPECT(at.layout == D3D12_BARRIER_LAYOUT(0xffffffff) && at.clear == nullptr);
     EXPECT(out == at.made && at.made->refs == 1);
     EXPECT(no_desc == E_INVALIDARG && !invalid && g_at_address.calls == 1);
     EXPECT(release(out) == 0);
@@ -1465,8 +1470,8 @@ int check_placed_hooks() {
         EXPECT(release(h) == 0 && heap_mock->refs == 0);
     }
     EXPECT(release(device) == 0 && mock->refs == 0);
-    std::printf("%s: slot 133 is E_NOTIMPL without a hook and forwards (address, desc, riid, out) to one; slot 14 "
-                "takes a heap as placed only when size == count * increment\n", g_label);
+    std::printf("%s: slot 133 is E_NOTIMPL without a hook and forwards (address, desc, barrier layout, clear, riid, "
+                "out) to one; slot 14 takes a heap as placed only when size == count * increment\n", g_label);
     return 0;
 }
 

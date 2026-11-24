@@ -41,8 +41,9 @@
 // - The pick for layout word 0 is VIctory's; what XGSuggestSwizzleMode returns on the console is unmeasured. Two
 //   additions of ours: a multisampled colour texture without the render-target flag takes SW_64KB_R_X (addrlib
 //   refuses MSAA in S/D modes), and 12-byte formats are always linear (addrlib refuses them tiled).
-// - Layout word 0x101 (seen at slot 76, docs/d3d12_vulkan.md 4.2) reads as SW_256B_S under the 0x100 | n rule. If
-//   it really means "tiled, the library's pick", pass kLayoutLibraryPick instead; the log at slot 25 should say.
+// - Layout word 0x101 (seen at slot 76, docs/d3d12_vulkan.md 4.2) reads as SW_256B_S under the 0x100 | n rule.
+//   VIctory's texture_layout reads the same (fxceless/victory-fork, crates/victory-gpu/src/resource.rs, the 0x100 | n
+//   arm), so the earlier "tiled, the library's pick" guess is dropped. 256 B modes have no mip tail.
 // - D3D12's public 64KB_UNDEFINED_SWIZZLE (2) and 64KB_STANDARD_SWIZZLE (3) words are taken as SW_64KB_S.
 // - No compression metadata: the console adds DCC, HTILE, CMASK or FMASK to render targets and depth buffers unless
 //   told not to, and its sizes for those may be larger than these. addrlib computes them from the GPU's pipe

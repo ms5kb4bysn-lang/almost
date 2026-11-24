@@ -24,6 +24,8 @@
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
+#include "../src/console_texture_layout.h"
+#include "../src/gfx10_tiling.h"
 #include "../src/cached_pso.h"
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
@@ -84,6 +86,28 @@ void log_once(const char* what, int value) {
     static std::set<std::pair<std::string, int>> seen;
     std::lock_guard lock(mutex);
     if (seen.insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
+}
+
+// True when every page of [address, address + bytes) is committed and readable by the CPU. A texture at a title
+// address is uploaded from that memory at creation; a reserve-only window (xmem's 64 KiB-page pools, whose pages the
+// title maps later) is refused there instead of faulting the process.
+bool host_range_readable(std::uint64_t address, std::uint64_t bytes) {
+    if (!address || !bytes) return false;
+    if (address + bytes < address) return false;
+    const std::uint64_t end = address + bytes;
+    for (std::uint64_t at = address; at < end;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), &info, sizeof(info)) !=
+                sizeof(info) ||
+            info.State != MEM_COMMIT || (info.Protect & PAGE_GUARD) || (info.Protect & 0xff) == PAGE_NOACCESS ||
+            (info.Protect & 0xff) == 0 || (info.Protect & 0xff) == PAGE_EXECUTE)
+            return false;
+        const std::uint64_t region_end =
+            reinterpret_cast<std::uintptr_t>(info.BaseAddress) + static_cast<std::uint64_t>(info.RegionSize);
+        if (region_end <= at) return false;
+        at = std::min(region_end, end);
+    }
+    return true;
 }
 
 // Two test settings that make the standalone device look like a GPU with fewer Vulkan queues, so the path where D3D12
@@ -566,6 +590,8 @@ std::filesystem::path configured_shader_directory() {
 }
 
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
+class Resource;
+
 struct DeviceState {
     VulkanDeviceInfo info;
     std::vector<std::uint32_t> families;
@@ -684,6 +710,68 @@ struct DeviceState {
             return unified ? reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(va)) : mapped + va;
         }
     } arena;
+
+    // Textures made at a title address (Xbox device slot 133, CreatePlacedResourceX with a barrier layout, or one a
+    // view at an address asked for and nothing had made). Keyed by the address their T#s name them by. VIctory keys
+    // its placed textures by (address, the 14-word description) (victory-fork resource.rs PLACED_TEXTURES) so alias
+    // views in another format at one address can have their own resource; phase 1 keeps one per address and reports
+    // that limitation. The registry does not own the reference slot 133 returns (the title does); a texture the layer
+    // made on its own for a view holds one, released when the address is reused or the device goes. A texture's
+    // destructor removes its own entry only while the address still maps to it, so a newer texture at the same address
+    // keeps its T#s and views.
+    struct PlacedTexture {
+        ID3D12Resource* resource = nullptr;
+        bool owns_reference = false;
+    };
+    mutable std::mutex placed_texture_mutex;
+    std::map<std::uint64_t, PlacedTexture> placed_textures;
+
+    void register_placed_texture(std::uint64_t address, ID3D12Resource* resource) {
+        PlacedTexture replaced{};
+        {
+            std::lock_guard lock(placed_texture_mutex);
+            auto [it, inserted] = placed_textures.try_emplace(address);
+            if (!inserted) replaced = it->second;
+            it->second = {resource, false};
+        }
+        if (replaced.owns_reference && replaced.resource) replaced.resource->Release();
+    }
+    ID3D12Resource* placed_texture(std::uint64_t address) const {
+        std::lock_guard lock(placed_texture_mutex);
+        const auto it = placed_textures.find(address);
+        return it == placed_textures.end() ? nullptr : it->second.resource;
+    }
+    // A texture made for a view: no COM reference will hold it, so the registry keeps one.
+    bool hold_placed_texture(std::uint64_t address, ID3D12Resource* resource) {
+        std::lock_guard lock(placed_texture_mutex);
+        const auto it = placed_textures.find(address);
+        if (it == placed_textures.end() || it->second.resource != resource) return false;
+        if (!it->second.owns_reference) {
+            it->second.owns_reference = true;
+            resource->AddRef();
+        }
+        return true;
+    }
+    // True when the resource should forget its image address: there is no entry (an ordinary synthetic address) or
+    // the entry is this resource's. False when a newer texture at the same address must keep its views and T#s.
+    bool release_placed_texture(std::uint64_t address, const ID3D12Resource* resource) {
+        std::lock_guard lock(placed_texture_mutex);
+        const auto it = placed_textures.find(address);
+        if (it == placed_textures.end()) return true;
+        if (it->second.resource != resource) return false;
+        placed_textures.erase(it);
+        return true;
+    }
+    // Device teardown: release what the registry holds, before the Vulkan objects go.
+    void clear_placed_textures() {
+        std::map<std::uint64_t, PlacedTexture> textures;
+        {
+            std::lock_guard lock(placed_texture_mutex);
+            textures.swap(placed_textures);
+        }
+        for (auto& [address, placed] : textures)
+            if (placed.owns_reference && placed.resource) placed.resource->Release();
+    }
 
     // Imports into the unified arena, by address (unified_import / unified_forget).
     struct Imported {
@@ -1903,7 +1991,10 @@ public:
             if (buffer_va_ && buffer_va_ != gpu_va_) device_.context->unregister_acceleration_structure(buffer_va_);
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::acceleration_structure, accel_);
         }
-        if (image_address_) device_.forget_image(image_address_);
+        // A texture at a title address: only the texture that still owns that address may forget the T#s that name
+        // it. If a newer texture was made there first, its entries (and views) stay.
+        if (image_address_ && device_.release_placed_texture(image_address_, this))
+            device_.forget_image(image_address_);
         device_.context->remove_resource(id());
         if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
         if (image_ && !sparse_image_)
@@ -1936,6 +2027,12 @@ public:
     VkImageAspectFlags aspects() const { return aspects_; }
     bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
+    // The address the title placed the texture at (device slot 133): its T#s name the texture by that address, not a
+    // synthetic one. Set right after create_texture; the destructor unregisters it from the device's registry.
+    void set_image_address(std::uint64_t address) { image_address_ = address; }
+    // The image is filled from the title's memory right after creation: the first command that touches it (the
+    // upload copy) must not zero-fill it first. Set before create_texture.
+    void keep_contents() { keep_contents_ = true; }
     VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
     const DeviceState& device_state() const { return device_; }
 
@@ -2245,7 +2342,7 @@ public:
         binding.color_attachment = (info.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
         binding.sampled = (info.usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0;
         binding.simultaneous_access = (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) != 0;
-        binding.not_zeroed = (heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) != 0;
+        binding.not_zeroed = keep_contents_ || (heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) != 0;
         // With the bindless set, a view's descriptor has one layout for as long as it lives (bind_image).
         binding.sampled_in_general = device_.bindless != nullptr;
         format_ = format.format;
@@ -2264,6 +2361,111 @@ public:
         // state that command expects (vulkan_replay.h, initialize), so no submission is needed here.
         device_.context->add_resource(id(), binding, VK_IMAGE_LAYOUT_UNDEFINED);
         return S_OK;
+    }
+
+    // Fills the image from the console layout's bytes at `source`, the address the title placed them at. Phase 1
+    // covers a linear 2D colour texture (every mip, rows at the console pitch) and the tiled modes TiledSurface2D
+    // addresses: SW_256B_S/D (every mip) and SW_4KB_S / SW_64KB_D (every mip, the mip tail copied out of the leading
+    // block). The caller has already checked the description is one of those. False when the layout's numbers do not
+    // match what the image and the detiler expect, so nothing is guessed.
+    bool upload_console_layout(const leonida::gfx10::ConsoleTextureLayout& layout, std::uint64_t source) {
+        using namespace leonida::gfx10;
+        if (!image_ || layout.plane_count != 1 || layout.array_size != 1) return false;
+        const ConsolePlaneLayout& plane = layout.planes[0];
+        const bool linear = layout.mode == SwizzleMode::linear;
+        TileMode tile_mode = TileMode::sw_256b_s;
+        if (!linear) {
+            if (layout.mode == SwizzleMode::sw_256b_s) tile_mode = TileMode::sw_256b_s;
+            else if (layout.mode == SwizzleMode::sw_256b_d) tile_mode = TileMode::sw_256b_d;
+            else if (layout.mode == SwizzleMode::sw_4kb_s) tile_mode = TileMode::sw_4kb_s;
+            else if (layout.mode == SwizzleMode::sw_64kb_d) tile_mode = TileMode::sw_64kb_d;
+            else return false;
+        }
+        // The mip tail, when there is one, is the leading block of the slice: mips packed smallest first, mip 0 last
+        // (VIctory-fork victory-formats texture.rs: the tail at offset 0, standard mips after it). Detile the block
+        // once, then copy each tail mip's rectangle from it.
+        std::vector<std::byte> tail_linear;
+        std::uint32_t tail_width = 0, tail_height = 0;
+        bool has_tail = false;
+        for (std::uint32_t mip = 0; mip < layout.mip_levels; ++mip)
+            has_tail = has_tail || plane.mips[mip].in_tail;
+        if (has_tail) {
+            TiledSurface2D probe;
+            if (!TiledSurface2D::make(tile_mode, plane.element_bytes, 1, 1, probe)) return false;
+            tail_width = static_cast<std::uint32_t>(probe.tile_width());
+            tail_height = static_cast<std::uint32_t>(probe.tile_height());
+            const std::uint64_t block_bytes = probe.tiled_size();
+            if (plane.offset > layout.size || block_bytes > layout.size - plane.offset) return false;
+            TiledSurface2D block;
+            if (!TiledSurface2D::make(tile_mode, plane.element_bytes, tail_width, tail_height, block) ||
+                block.tiled_size() != block_bytes)
+                return false;
+            tail_linear.resize(static_cast<std::size_t>(block_bytes));
+            const auto bytes = std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(source + plane.offset)),
+                static_cast<std::size_t>(block_bytes));
+            if (!block.detile(bytes, tail_linear, std::size_t(tail_width) * plane.element_bytes)) return false;
+        }
+        const auto unpack = [](const std::byte*, std::uint64_t) {};
+        for (std::uint32_t mip = 0; mip < layout.mip_levels; ++mip) {
+            const ConsoleMipLayout& level = plane.mips[mip];
+            Region r{};
+            if (!region(mip, nullptr, r) || !r.rows || r.slices != 1) return false;
+            const std::uint64_t row_bytes = std::uint64_t(level.width) * plane.element_bytes;
+            if (r.row_bytes != row_bytes || r.rows != level.height) return false;
+            if (linear) {
+                const std::uint64_t offset = plane.offset + level.offset;
+                if (offset > layout.size || row_bytes > layout.size - offset) return false;
+                const std::uint64_t pitch = std::uint64_t(level.pitch) * plane.element_bytes;
+                const std::uint64_t span = std::uint64_t(level.height - 1) * pitch + row_bytes;
+                if (pitch < row_bytes || span > layout.size - offset) return false;
+                const auto* bytes =
+                    reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(source + offset));
+                const std::uint32_t rows = level.height;
+                const auto pack = [=](std::byte* to, std::uint64_t staging_pitch) {
+                    for (std::uint32_t y = 0; y < rows; ++y)
+                        std::memcpy(to + std::uint64_t(y) * staging_pitch, bytes + std::uint64_t(y) * pitch,
+                                    std::size_t(row_bytes));
+                };
+                if (staged_copy(true, mip, r, pack, unpack) != S_OK) return false;
+                continue;
+            }
+            std::vector<std::byte> linear_rows(std::size_t(row_bytes) * level.height);
+            if (level.in_tail) {
+                if (!has_tail || std::uint64_t(level.tail_x) + level.width > tail_width ||
+                    std::uint64_t(level.tail_y) + level.height > tail_height)
+                    return false;
+                const std::uint64_t block_pitch = std::uint64_t(tail_width) * plane.element_bytes;
+                for (std::uint32_t y = 0; y < level.height; ++y)
+                    std::memcpy(linear_rows.data() + std::uint64_t(y) * row_bytes,
+                                tail_linear.data() +
+                                    (std::uint64_t(level.tail_y) + y) * block_pitch +
+                                    std::uint64_t(level.tail_x) * plane.element_bytes,
+                                std::size_t(row_bytes));
+            } else {
+                const std::uint64_t offset = plane.offset + level.offset;
+                if (offset > layout.size) return false;
+                TiledSurface2D surface;
+                if (!TiledSurface2D::make(tile_mode, plane.element_bytes, level.width, level.height, surface))
+                    return false;
+                const std::uint64_t tiled_size = surface.tiled_size();
+                const std::uint64_t expected =
+                    std::uint64_t(level.pitch) * level.padded_height * plane.element_bytes;
+                if (tiled_size != expected || tiled_size > layout.size - offset) return false;
+                const auto bytes = std::span<const std::byte>(
+                    reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(source + offset)),
+                    static_cast<std::size_t>(tiled_size));
+                if (!surface.detile(bytes, linear_rows, std::size_t(row_bytes))) return false;
+            }
+            const std::uint32_t rows = level.height;
+            const auto pack = [&](std::byte* to, std::uint64_t staging_pitch) {
+                for (std::uint32_t y = 0; y < rows; ++y)
+                    std::memcpy(to + std::uint64_t(y) * staging_pitch,
+                                linear_rows.data() + std::uint64_t(y) * row_bytes, std::size_t(row_bytes));
+            };
+            if (staged_copy(true, mip, r, pack, unpack) != S_OK) return false;
+        }
+        return true;
     }
 
     // D3D12 reports the placement alignment of a description that left it 0: 64 KiB, or 4 MiB for a multisampled
@@ -2602,6 +2804,7 @@ private:
     bool placed_ = false;
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
     bool host_transfer_ = false;          // created with VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT
+    bool keep_contents_ = false;          // filled from the title's memory before first use: skip the zero fill
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
@@ -5539,6 +5742,9 @@ public:
     }
 
     ~Device() override {
+        // A texture the registry made for a placed view has no other owner; release it before the Vulkan objects go
+        // (the application's own slot 133 textures are its references, not ours).
+        if (state_.context) state_.clear_placed_textures();
         if (state_.context) {
             {
                 std::lock_guard lock(state_.context->submit_mutex());
@@ -6063,8 +6269,9 @@ public:
     // (resource description, view description, CPU handle). The console view description is the PC one (10 words)
     // followed by the 64-bit address in words 10-11 (Marvisak/VIctory descriptor.rs and descriptor/host.rs, facts
     // only). A buffer, with the unified arena, becomes a view of a buffer resource at that address (made once per
-    // address and size and kept, as VIctory keeps its placed textures). A texture there is not mirrored yet: its slot
-    // gets a null view of the same kind, said once.
+    // address and size and kept, as VIctory keeps its placed textures). A texture there is the registry's (slot 133's,
+    // or one made here: mirrored, a render-target/UAV image, or a 1x1 placeholder), and a description too broken to
+    // shape a resource at all still gets main's view-shaped placeholder, so a view is never null.
     void create_placed_view(bool unordered, const D3D12_RESOURCE_DESC& resource_desc, const std::uint32_t* view_words,
                             D3D12_CPU_DESCRIPTOR_HANDLE handle) {
         const std::uint64_t address = std::uint64_t(view_words[10]) | std::uint64_t(view_words[11]) << 32;
@@ -6082,7 +6289,61 @@ public:
             }
             if (it != placed_view_resources_.end()) resource = it->second;
         } else if (resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
-            log_once("placed texture view not mirrored yet (null view); dimension", int(resource_desc.Dimension));
+            // A texture at the address the view's words name: the device's registry has it if slot 133 made it, and
+            // otherwise one is made now from the description, from the title's memory. A view holds no COM reference,
+            // so the registry keeps the texture alive when this creation is the one that made it.
+            resource = state_.placed_texture(address);
+            if (!address) {
+                log_once("placed texture view without an address (null view); dimension",
+                         int(resource_desc.Dimension));
+            } else if (!resource) {
+                void* made = nullptr;
+                const D3D12_BARRIER_LAYOUT layout = unordered ? D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS
+                                                              : D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE;
+                if (SUCCEEDED(create_texture_at_address(address, resource_desc, layout, nullptr,
+                                                        __uuidof(ID3D12Resource), &made)) &&
+                    made) {
+                    auto* texture = static_cast<ID3D12Resource*>(made);
+                    if (state_.hold_placed_texture(address, texture)) {
+                        texture->Release();  // the registry keeps the one reference
+                        resource = texture;
+                    } else {
+                        // Another texture took the address meanwhile: the registry's is the one T#s name now.
+                        texture->Release();
+                        resource = state_.placed_texture(address);
+                    }
+                } else {
+                    // Last resort: the description could not shape even a placeholder (an unknown format, usually).
+                    // Main's view-shaped 1x1 placeholder keeps the descriptor valid.
+                    Resource* placeholder = nullptr;
+                    if (SUCCEEDED(create_placeholder_for_view_at_address(address, unordered, view_words, placeholder))) {
+                        auto* texture = static_cast<ID3D12Resource*>(placeholder);
+                        state_.register_placed_texture(address, texture);
+                        if (state_.hold_placed_texture(address, texture)) {
+                            texture->Release();  // the registry keeps the one reference
+                            resource = texture;
+                            log_placeholder(address, view_words[0], view_words[1], "view-shaped placeholder");
+                        } else {
+                            texture->Release();
+                            resource = state_.placed_texture(address);
+                        }
+                    }
+                    if (!resource) {
+                        static std::atomic<int> said{0};
+                        if (said.fetch_add(1) < 8)
+                            std::fprintf(stderr,
+                                         "[rt] d3d12: placed %s view of texture memory at 0x%llx: no resource there "
+                                         "and none could be made (dimension %u, %llux%u, %u mips, format %u, flags 0x%x, "
+                                         "layout 0x%x)\n",
+                                         unordered ? "UAV" : "SRV", static_cast<unsigned long long>(address),
+                                         static_cast<unsigned>(resource_desc.Dimension),
+                                         static_cast<unsigned long long>(resource_desc.Width), resource_desc.Height,
+                                         resource_desc.MipLevels, static_cast<unsigned>(resource_desc.Format),
+                                         static_cast<unsigned>(resource_desc.Flags),
+                                         static_cast<unsigned>(static_cast<std::uint32_t>(resource_desc.Layout)));
+                    }
+                }
+            }
         }
         if (unordered)
             CreateUnorderedAccessView(resource, nullptr,
@@ -7351,7 +7612,8 @@ private:
 public:
     // A buffer over memory the title mapped itself, at its address (Xbox device slot 133, CreatePlacedResourceX with a
     // barrier layout; d3d12_xs_device.cpp). Only with the unified arena, where offset == address and the title's pages
-    // are already bound there (xmem observer): the resource is that range, not zeroed. A texture there is refused.
+    // are already bound there (xmem observer): the resource is that range, not zeroed. Textures take
+    // create_texture_at_address.
     HRESULT create_buffer_at_address(UINT64 address, const D3D12_RESOURCE_DESC& desc, REFIID riid, void** out) {
         constexpr auto method = "XboxDevice::CreatePlacedResourceX(address)";
         if (out) *out = nullptr;
@@ -7361,8 +7623,8 @@ public:
             return d3d12_trace::result(method, E_NOTIMPL);
         }
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
-            log_once("texture at a title address is not implemented; dimension", int(desc.Dimension));
-            return d3d12_trace::result(method, E_NOTIMPL);
+            log_once("create_buffer_at_address on a texture; dimension", int(desc.Dimension));
+            return d3d12_trace::result(method, E_INVALIDARG);
         }
         if (!address || !desc.Width || address + desc.Width > state_.arena.size || address + desc.Width < address)
             return d3d12_trace::result(method, E_INVALIDARG);
@@ -7381,7 +7643,333 @@ public:
         return d3d12_trace::result(method, hand_out(resource, riid, out));
     }
 
+    // The mirror half of create_texture_at_address: a texture whose console bytes can be read at `address` becomes a
+    // device-local VkImage holding them. Console tile bytes are not a Vulkan image layout, so the title's pages are
+    // the source: a normal optimal image (Resource::create_texture) is made with the console description, its T# base
+    // is set to the title address, and phase 1 uploads the levels it can read (linear 2D colour, and the SW_256B_S/D,
+    // SW_4KB_S and SW_64KB_D modes detiled with gfx10::TiledSurface2D, mip tails included). Anything else is refused
+    // with the layout and mode it saw, never guessed; the caller then makes a placeholder. The barrier layout and
+    // clear value come along for later phases; nothing here writes back.
+    HRESULT create_mirrored_texture_at_address(UINT64 address, const D3D12_RESOURCE_DESC& desc,
+                                               D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* clear, REFIID riid,
+                                               void** out) {
+        constexpr auto method = "XboxDevice::CreatePlacedResourceX(address)";
+        (void)layout;
+        (void)clear;
+        if (out) *out = nullptr;
+        if (!state_.arena.unified) {
+            log_once("texture at a title address needs the unified arena (LEONIDA_UNIFIED_GB); dimension",
+                     int(desc.Dimension));
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return d3d12_trace::result(method, E_INVALIDARG);
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+            log_once("texture at a title address: only 2D textures are read; dimension", int(desc.Dimension));
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        leonida::gfx10::ConsoleResourceDesc console{};
+        console.dimension = static_cast<std::uint32_t>(desc.Dimension);
+        console.alignment = desc.Alignment;
+        console.width = desc.Width;
+        console.height = desc.Height;
+        console.depth_or_array_size = desc.DepthOrArraySize;
+        console.mip_levels = desc.MipLevels;
+        console.format = static_cast<std::uint32_t>(desc.Format);
+        console.sample_count = desc.SampleDesc.Count;
+        console.sample_quality = desc.SampleDesc.Quality;
+        console.layout = static_cast<std::uint32_t>(desc.Layout);
+        console.flags = static_cast<std::uint32_t>(desc.Flags);
+        leonida::gfx10::ConsoleTextureLayout console_layout;
+        const auto model = leonida::gfx10::compute_console_texture_layout(console, console_layout);
+        if (model != leonida::gfx10::ConsoleLayoutStatus::ok) {
+            log_once("texture at a title address: the console layout model refused the description; layout word",
+                     int(console.layout));
+            return d3d12_trace::result(
+                method, model == leonida::gfx10::ConsoleLayoutStatus::invalid ? E_INVALIDARG : E_NOTIMPL);
+        }
+        leonida::gfx10::ConsoleFormat element;
+        if (!leonida::gfx10::console_format(console.format, element)) {
+            log_once("texture at a title address: no element size for the format; format", int(console.format));
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        // The address must hold every byte the console layout spans, aligned as the layout asks, inside the range the
+        // title's pages live in. desc.Width is texels, not bytes: the layout's allocation is what has to fit.
+        if (!address || !console_layout.alignment || console_layout.allocation_size > state_.arena.size ||
+            address > state_.arena.size - console_layout.allocation_size ||
+            address % console_layout.alignment || address + console_layout.allocation_size < address) {
+            static std::atomic<int> bad{0};
+            if (bad.fetch_add(1) < 8)
+                std::fprintf(stderr,
+                             "[rt] d3d12: texture at 0x%llx refused: the console layout needs 0x%llx bytes aligned "
+                             "%llu, inside a %llu-byte arena\n",
+                             static_cast<unsigned long long>(address),
+                             static_cast<unsigned long long>(console_layout.allocation_size),
+                             static_cast<unsigned long long>(console_layout.alignment),
+                             static_cast<unsigned long long>(state_.arena.size));
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
+        const char* const mode_name =
+            console_layout.mode == leonida::gfx10::SwizzleMode::linear        ? "linear"
+            : console_layout.mode == leonida::gfx10::SwizzleMode::sw_4kb_s    ? "SW_4KB_S"
+            : console_layout.mode == leonida::gfx10::SwizzleMode::sw_64kb_d   ? "SW_64KB_D"
+            : console_layout.mode == leonida::gfx10::SwizzleMode::sw_64kb_s   ? "SW_64KB_S"
+            : console_layout.mode == leonida::gfx10::SwizzleMode::sw_256b_s   ? "SW_256B_S"
+            : console_layout.mode == leonida::gfx10::SwizzleMode::sw_256b_d   ? "SW_256B_D"
+            : console_layout.mode == leonida::gfx10::SwizzleMode::sw_64kb_s_x ? "SW_64KB_S_X"
+            : console_layout.mode == leonida::gfx10::SwizzleMode::sw_64kb_r_x ? "SW_64KB_R_X"
+            : console_layout.mode == leonida::gfx10::SwizzleMode::sw_64kb_z_x ? "SW_64KB_Z_X"
+                                                                              : "other";
+        // Phase 1's upload: a linear 2D colour texture (any mip chain), or one in a tiled mode TiledSurface2D can
+        // address: SW_256B_S/D (no mip tail) and SW_4KB_S / SW_64KB_D (mip tails detiled through the leading block).
+        // VIctory-fork texture_layout (crates/victory-gpu/src/resource.rs:150-157) reads a layout word 0x100 | n as
+        // addrlib mode n, so 0x101 is SW_256B_S, not the SW_64KB_D an older note guessed.
+        bool tiled = false;
+        if (console_layout.mode == leonida::gfx10::SwizzleMode::linear) {
+            tiled = false;
+        } else if (console_layout.mode == leonida::gfx10::SwizzleMode::sw_256b_s ||
+                   console_layout.mode == leonida::gfx10::SwizzleMode::sw_256b_d ||
+                   console_layout.mode == leonida::gfx10::SwizzleMode::sw_4kb_s ||
+                   console_layout.mode == leonida::gfx10::SwizzleMode::sw_64kb_d) {
+            tiled = true;
+        } else {
+            static std::atomic<int> mode{0};
+            if (mode.fetch_add(1) < 8)
+                std::fprintf(stderr,
+                             "[rt] d3d12: texture at 0x%llx refused: layout word 0x%x reads as %s; only linear, "
+                             "the 256 B, 4 KiB S and 64 KiB D modes upload\n",
+                             static_cast<unsigned long long>(address), static_cast<unsigned>(console.layout),
+                             mode_name);
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        if (desc.SampleDesc.Count != 1 || desc.DepthOrArraySize != 1 || element.stencil ||
+            console_layout.plane_count != 1) {
+            static std::atomic<int> shape{0};
+            if (shape.fetch_add(1) < 8)
+                std::fprintf(stderr,
+                             "[rt] d3d12: texture at 0x%llx refused: only single-slice, single-sample colour is "
+                             "read (samples %u, array %u, stencil %d)\n",
+                             static_cast<unsigned long long>(address), desc.SampleDesc.Count,
+                             static_cast<unsigned>(desc.DepthOrArraySize), element.stencil ? 1 : 0);
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        if (tiled && element.element_bytes != 1 && element.element_bytes != 2 && element.element_bytes != 4 &&
+            element.element_bytes != 8 && element.element_bytes != 16) {
+            log_once("texture at a title address: no detiler for this element size; bytes", int(element.element_bytes));
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        const Format format = state_.texture_format(desc);
+        if (format.format == VK_FORMAT_UNDEFINED || format.rgb96) {
+            log_once("texture at a title address: no image format for the description (96-bit is not read); format",
+                     int(console.format));
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        if (format.aspects != VK_IMAGE_ASPECT_COLOR_BIT) {
+            log_once("texture at a title address: only colour aspects are read; format", int(console.format));
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        // The source is CPU memory the upload reads now. A window whose pages the title maps later (xmem's page
+        // pools) is not committed yet: refuse instead of faulting.
+        if (!host_range_readable(address, console_layout.allocation_size)) {
+            static std::atomic<int> memory{0};
+            if (memory.fetch_add(1) < 8)
+                std::fprintf(stderr,
+                             "[rt] d3d12: texture at 0x%llx refused: 0x%llx bytes of the console layout are not "
+                             "committed readable memory yet\n",
+                             static_cast<unsigned long long>(address),
+                             static_cast<unsigned long long>(console_layout.allocation_size));
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        if (!out) return d3d12_trace::result(method, E_POINTER);
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        // Placed, with no GPU VA: D3D12 answers 0 from GetGPUVirtualAddress for a texture, and T#s find the image by
+        // the title address its image_address_ is set to.
+        auto* resource = new Resource(state_, desc, heap, D3D12_HEAP_FLAG_NONE, 0);
+        resource->attach_device(identity());
+        resource->keep_contents();
+        HRESULT hr = resource->create_texture(format, {});
+        if (SUCCEEDED(hr)) resource->set_image_address(address);
+        if (SUCCEEDED(hr) && !resource->upload_console_layout(console_layout, address)) {
+            static std::atomic<int> upload{0};
+            if (upload.fetch_add(1) < 8)
+                std::fprintf(stderr,
+                             "[rt] d3d12: texture at 0x%llx: the %s bytes do not match what the image and detiler "
+                             "expect; refused\n",
+                             static_cast<unsigned long long>(address), mode_name);
+            hr = E_FAIL;
+        }
+        if (FAILED(hr)) {
+            resource->Release();
+            return d3d12_trace::result(method, hr);
+        }
+        state_.register_placed_texture(address, static_cast<ID3D12Resource*>(resource));
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr,
+                         "[rt] d3d12: texture at the title's address 0x%llx: %llux%u, format %u, layout word 0x%x "
+                         "read as %s, %u mip(s), uploaded into a device-local image\n",
+                         static_cast<unsigned long long>(address), static_cast<unsigned long long>(desc.Width),
+                         desc.Height, static_cast<unsigned>(desc.Format), static_cast<unsigned>(console.layout),
+                         mode_name, console_layout.mip_levels);
+        return d3d12_trace::result(method, hand_out(resource, riid, out));
+    }
+
+    // A texture at a title address (Xbox device slot 133), or one a placed view asked for. In order:
+    // - a render target, depth or UAV description (the barrier layout or the resource flags say so) is a real optimal
+    //   image of the whole description, never uploaded and never refused for its console swizzle word: the word is
+    //   memory the console would have used, and this image is device-local. A8 render targets take main's R8 path.
+    // - otherwise, with the unified arena, a mirror of the console bytes where they are readable
+    //   (create_mirrored_texture_at_address).
+    // - otherwise, or when the mirror does not read that description, a 1x1 placeholder of the description's format,
+    //   dimension, array size, sample count and mip count, so the title always gets a valid resource and its views are
+    //   never null. Placeholders are registered like mirrored textures and logged.
+    HRESULT create_texture_at_address(UINT64 address, const D3D12_RESOURCE_DESC& desc, D3D12_BARRIER_LAYOUT layout,
+                                      const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) {
+        constexpr auto method = "XboxDevice::CreatePlacedResourceX(address)";
+        if (out) *out = nullptr;
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || !address)
+            return d3d12_trace::result(method, E_INVALIDARG);
+        if (!out) return d3d12_trace::result(method, E_POINTER);
+        if (texture_is_rendering(desc, layout)) {
+            Resource* resource = nullptr;
+            const HRESULT hr = create_rendering_texture_at_address(address, desc, resource);
+            if (SUCCEEDED(hr))
+                return d3d12_trace::result(method, hand_out(resource, riid, out));
+            if (hr == E_OUTOFMEMORY) return d3d12_trace::result(method, hr);
+            log_once("texture at a title address: the render-target/UAV image was refused, using a placeholder; format",
+                     int(desc.Format));
+        } else if (state_.arena.unified) {
+            const HRESULT hr = create_mirrored_texture_at_address(address, desc, layout, clear, riid, out);
+            if (SUCCEEDED(hr) || (hr != E_NOTIMPL && hr != E_INVALIDARG && hr != E_FAIL)) return hr;
+        }
+        Resource* placeholder = nullptr;
+        const HRESULT hr = create_placeholder_at_address(address, desc, placeholder);
+        if (FAILED(hr)) return d3d12_trace::result(method, hr);
+        state_.register_placed_texture(address, static_cast<ID3D12Resource*>(placeholder));
+        log_placeholder(address, static_cast<UINT>(desc.Format), static_cast<UINT>(desc.Dimension),
+                        "unmirrorable description");
+        return d3d12_trace::result(method, hand_out(placeholder, riid, out));
+    }
+
 private:
+    // A description the console would have used as render-target, depth or UAV storage: the layer makes it a real
+    // device-local image of the whole description, whatever the console swizzle word says.
+    static bool texture_is_rendering(const D3D12_RESOURCE_DESC& desc, D3D12_BARRIER_LAYOUT layout) {
+        const UINT flags = static_cast<UINT>(desc.Flags);
+        if (flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+            return true;
+        switch (layout) {
+        case D3D12_BARRIER_LAYOUT_RENDER_TARGET:
+        case D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS:
+        case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE:
+        case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ:
+        case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS:
+        case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS: return true;
+        default: return false;
+        }
+    }
+
+    // A placed texture's Resource: device-local image, no GPU VA, T# base at the title address. The caller registers
+    // it (and hand_out gives the title its reference).
+    HRESULT new_texture_at_address(UINT64 address, const D3D12_RESOURCE_DESC& desc, bool keep_contents,
+                                   Resource*& out) {
+        const Format format = state_.texture_format(desc);
+        if (format.format == VK_FORMAT_UNDEFINED) return E_NOTIMPL;
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        auto* resource = new Resource(state_, desc, heap, D3D12_HEAP_FLAG_NONE, 0);
+        resource->attach_device(identity());
+        if (keep_contents) resource->keep_contents();
+        const HRESULT hr = resource->create_texture(format, {});
+        if (FAILED(hr)) {
+            resource->Release();
+            return hr;
+        }
+        resource->set_image_address(address);
+        out = resource;
+        return S_OK;
+    }
+
+    // A render target, depth buffer or UAV: the full description as an optimal image, not uploaded and not refused
+    // for a console swizzle mode (the image is device-local; R_X, Z_X and 0x101 are console memory layouts).
+    HRESULT create_rendering_texture_at_address(UINT64 address, const D3D12_RESOURCE_DESC& desc, Resource*& out) {
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+            desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+            return E_NOTIMPL;
+        Resource* resource = nullptr;
+        const HRESULT hr = new_texture_at_address(address, desc, false, resource);
+        if (FAILED(hr)) return hr;
+        state_.register_placed_texture(address, static_cast<ID3D12Resource*>(resource));
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1) < 8)
+            std::fprintf(stderr,
+                         "[rt] d3d12: texture at the title's address 0x%llx: %llux%u x%u, %u mip(s), format %u, "
+                         "layout word 0x%x: render-target/UAV image (not uploaded)\n",
+                         static_cast<unsigned long long>(address), static_cast<unsigned long long>(desc.Width),
+                         desc.Height, static_cast<unsigned>(desc.DepthOrArraySize), desc.MipLevels,
+                         static_cast<unsigned>(desc.Format), static_cast<unsigned>(desc.Layout));
+        out = resource;
+        return S_OK;
+    }
+
+    // The last resort: a 1x1 resource of the description's format, dimension, array size, sample count and mip count.
+    // Its content is not the title's, but every view the descriptor asks for is valid and its T# names the address.
+    HRESULT create_placeholder_at_address(UINT64 address, const D3D12_RESOURCE_DESC& desc, Resource*& out) {
+        D3D12_RESOURCE_DESC placeholder{};
+        placeholder.Dimension = desc.Dimension;
+        placeholder.Width = 1;
+        placeholder.Height = 1;
+        placeholder.DepthOrArraySize = desc.DepthOrArraySize ? desc.DepthOrArraySize : 1;
+        placeholder.MipLevels = desc.MipLevels;
+        placeholder.Format = desc.Format;
+        placeholder.SampleDesc.Count = desc.SampleDesc.Count ? desc.SampleDesc.Count : 1;
+        placeholder.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        placeholder.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+            static_cast<UINT>(desc.Flags) & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                             D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+        return new_texture_at_address(address, placeholder, false, out);
+    }
+
+    // A view at an address with no resource and a description too broken to shape a resource: main's 1x1 placeholder,
+    // shaped by the view description's format and dimension.
+    HRESULT create_placeholder_for_view_at_address(UINT64 address, bool unordered, const std::uint32_t* words,
+                                                   Resource*& out) {
+        const DXGI_FORMAT format = static_cast<DXGI_FORMAT>(words[0]);
+        const auto view_dimension = static_cast<D3D12_SRV_DIMENSION>(words[1]);
+        if (format == DXGI_FORMAT_UNKNOWN) return E_INVALIDARG;
+        D3D12_RESOURCE_DESC placeholder{};
+        placeholder.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        placeholder.Width = 1;
+        placeholder.Height = 1;
+        placeholder.DepthOrArraySize = 1;
+        placeholder.MipLevels = 1;
+        placeholder.Format = format;
+        placeholder.SampleDesc.Count = 1;
+        placeholder.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        placeholder.Flags = unordered ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+        switch (view_dimension) {
+        case D3D12_SRV_DIMENSION_TEXTURE3D: placeholder.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D; break;
+        case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+            placeholder.DepthOrArraySize = static_cast<UINT16>(std::max(1u, words[4]));
+            break;
+        case D3D12_SRV_DIMENSION_TEXTURECUBE: placeholder.DepthOrArraySize = 6; break;
+        case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+            placeholder.DepthOrArraySize = static_cast<UINT16>(6 * std::max(1u, words[5]));
+            break;
+        default: break;
+        }
+        return new_texture_at_address(address, placeholder, false, out);
+    }
+
+    void log_placeholder(UINT64 address, UINT format, UINT dimension, const char* why) {
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1) < 32)
+            std::fprintf(stderr,
+                         "[rt] d3d12: placed texture at 0x%llx: 1x1 placeholder (format %u, dimension %u; %s)\n",
+                         static_cast<unsigned long long>(address), format, dimension, why);
+    }
+
     // Footprints for copies through a buffer: rows padded to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (512 for planar
     // depth-stencil), subresources placed at D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, block-compressed sizes rounded up to whole blocks, depth-stencil
     // formats as two planes. d3d12_vulkan_device_test compares every output with the PC runtime's.
@@ -8851,6 +9439,27 @@ HRESULT create_buffer_at_address(ID3D12Device* device, UINT64 address, const D3D
     return E_NOTIMPL;  // a PC runtime device: no title-mapped resources
 }
 
+// A texture over memory the title placed at `address` (Xbox device slot 133). The barrier layout and clear value are
+// the console call's third and fourth arguments; phase 1 keeps them for later and uploads what it can read.
+HRESULT create_texture_at_address(ID3D12Device* device, UINT64 address, const D3D12_RESOURCE_DESC* desc,
+                                  D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* clear, REFIID riid,
+                                  void** out) {
+    if (out) *out = nullptr;
+    if (!device || !desc) return E_INVALIDARG;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (auto* d = Device::from<Device>(real ? real : device))
+        return d->create_texture_at_address(address, *desc, layout, clear, riid, out);
+    return E_NOTIMPL;  // a PC runtime device: no title-mapped resources
+}
+
+// The resource the device holds for a texture at a title address, or null. For tests.
+ID3D12Resource* placed_texture_at_address(ID3D12Device* device, UINT64 address) {
+    if (!device || !address) return nullptr;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    const Device* d = Device::from<Device>(real ? real : device);
+    return d ? d->state().placed_texture(address) : nullptr;
+}
+
 HRESULT create_descriptor_heap_at(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc, UINT64 address,
                                   REFIID riid, void** out) {
     if (out) *out = nullptr;
@@ -8869,10 +9478,22 @@ void create_placed_view(ID3D12Device* device, bool unordered, const D3D12_RESOUR
 }
 
 namespace {
-// The proxy's device slots 133, 14 (a placed heap) and 70/71 (placed views) reach the layer through their hooks
-// (d3d12_xs_device.h).
+// Device slot 133's hook: a buffer keeps the buffer-at-address path, a texture takes the texture path with the
+// console call's barrier layout and clear value. The proxy's slots 14 (a placed heap) and 70/71 (placed views) reach
+// the layer through their own hooks (d3d12_xs_device.h).
+HRESULT create_at_address(ID3D12Device* device, UINT64 address, const D3D12_RESOURCE_DESC* desc,
+                          D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) {
+    if (out) *out = nullptr;
+    if (!device || !desc) return E_INVALIDARG;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    auto* d = Device::from<Device>(real ? real : device);
+    if (!d) return E_NOTIMPL;
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        return d->create_buffer_at_address(address, *desc, riid, out);
+    return d->create_texture_at_address(address, *desc, layout, clear, riid, out);
+}
 const bool g_registered_create_at_address = [] {
-    rt::d3d12_xs::set_create_at_address(&create_buffer_at_address);
+    rt::d3d12_xs::set_create_at_address(&create_at_address);
     rt::d3d12_xs::set_create_heap_at(&create_descriptor_heap_at);
     rt::d3d12_xs::set_create_placed_view(&create_placed_view);
     return true;

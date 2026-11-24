@@ -2019,31 +2019,6 @@ std::atomic<CreateAtAddressFn> g_create_at_address{nullptr};
 std::atomic<CreateHeapAtFn> g_create_heap_at{nullptr};
 std::atomic<CreatePlacedViewFn> g_create_placed_view{nullptr};
 
-// Textures the title placed at its own address (slot 133), made as committed resources for now because the GPU layer
-// cannot yet bind a Vulkan image to that memory. The address is kept so slots 70/71 can resolve a view of it from the
-// GPU VA in the view description; the resource is held (and replaced, released) per address.
-std::mutex g_at_address_mutex;
-std::unordered_map<std::uint64_t, ID3D12Resource*> g_at_address_resources;
-
-void register_at_address(std::uint64_t address, ID3D12Resource* resource) {
-    if (!address || !resource) return;
-    resource->AddRef();
-    ID3D12Resource* replaced = nullptr;
-    {
-        std::lock_guard lock(g_at_address_mutex);
-        auto& slot = g_at_address_resources[address];
-        replaced = slot;
-        slot = resource;
-    }
-    if (replaced) replaced->Release();
-}
-
-ID3D12Resource* resource_at_address(std::uint64_t address) {
-    std::lock_guard lock(g_at_address_mutex);
-    const auto it = g_at_address_resources.find(address);
-    return it == g_at_address_resources.end() ? nullptr : it->second;
-}
-
 // Device slots 70/71 (game_scarlett_master.exe 1.0.2.1 calls 70 at six sites through its device global, one
 // returning to exe+0x4ecc821; VIctory
 // device.rs create_placed_srv/uav): the PC chain's slot 70 is ID3D12Device8::CreatePlacedResource1, whose output
@@ -2057,105 +2032,10 @@ void proxy_create_placed_view(DeviceProxy* self, bool unordered, std::uint64_t r
                               std::uint64_t handle) {
     note_slot(unordered ? 71 : 70);
     // The view description is the PC SRV/UAV description followed by the resource's GPU VA at +0x28 (VIctory
-    // descriptor.rs). A texture made by slot 133 at that address is a committed resource here, so the view is made
-    // from it directly; the layer's own hook handles buffers and anything not registered.
-    if (view) {
-        const auto* words = reinterpret_cast<const std::uint32_t*>(view);
-        const std::uint64_t address = (static_cast<std::uint64_t>(words[11]) << 32) | words[10];
-        const auto* resource_desc = reinterpret_cast<const D3D12_RESOURCE_DESC*>(resource);
-        static std::atomic<int> unresolved{0};
-        if (resource_desc && !resource_at_address(address) && unresolved.fetch_add(1) < 24)
-            std::fprintf(stderr,
-                         "[rt] d3d12_xs: slot %u view at 0x%llx, desc dimension %u (%llux%u, %u mips), not made by slot "
-                         "133 here; view words %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
-                         unordered ? 71u : 70u, static_cast<unsigned long long>(address),
-                         static_cast<unsigned>(resource_desc->Dimension),
-                         static_cast<unsigned long long>(resource_desc->Width), resource_desc->Height,
-                         resource_desc->MipLevels, words[0], words[1], words[2], words[3], words[4], words[5], words[6],
-                         words[7], words[8], words[9], words[10], words[11]);
-        if (ID3D12Resource* target = resource_at_address(address)) {
-            const D3D12_CPU_DESCRIPTOR_HANDLE dst{static_cast<SIZE_T>(handle)};
-            if (unordered)
-                self->real->CreateUnorderedAccessView(
-                    target, nullptr, reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(words), dst);
-            else
-                self->real->CreateShaderResourceView(
-                    target, reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(words), dst);
-            return;
-        }
-        // A texture view of memory the title holds itself (the page pools texture streaming fills): until that
-        // memory can back a Vulkan image, make a 1x1 placeholder of the view's format at the address and register it,
-        // so the descriptor is real rather than null and the title's bookkeeping has an object. The image has none
-        // of the streamed data (sampling is wrong); it only keeps the frame's descriptors valid.
-        if (resource_desc && resource_desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
-            // The view description's own fields shape the placeholder: Format (word 0), ViewDimension (word 1) and
-            // the union after it (MipLevels, then ArraySize / NumCubes). A 1x1 resource of the matching dimension and
-            // array size keeps CreateShaderResourceView/CreateUnorderedAccessView valid; a mismatched one would fail
-            // and leave the null view the game crashes on.
-            const DXGI_FORMAT format = static_cast<DXGI_FORMAT>(words[0]);
-            const auto view_dimension = static_cast<D3D12_SRV_DIMENSION>(words[1]);
-            if (format != DXGI_FORMAT_UNKNOWN) {
-                D3D12_RESOURCE_DESC placeholder{};
-                placeholder.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-                placeholder.Width = 1;
-                placeholder.Height = 1;
-                placeholder.DepthOrArraySize = 1;
-                placeholder.MipLevels = 1;
-                placeholder.Format = format;
-                placeholder.SampleDesc.Count = 1;
-                placeholder.Flags = unordered ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
-                switch (view_dimension) {
-                case D3D12_SRV_DIMENSION_TEXTURE3D:
-                    placeholder.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-                    break;
-                case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
-                    placeholder.DepthOrArraySize = static_cast<UINT16>(std::max(1u, words[4]));
-                    break;
-                case D3D12_SRV_DIMENSION_TEXTURECUBE:
-                    placeholder.DepthOrArraySize = 6;
-                    break;
-                case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
-                    placeholder.DepthOrArraySize = static_cast<UINT16>(6 * std::max(1u, words[5]));
-                    break;
-                default: break;
-                }
-                D3D12_HEAP_PROPERTIES heap{};
-                heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-                void* made = nullptr;
-                // The placeholder is a plain PC description; the console translator must not see it.
-                const HRESULT hr = self->real->CreateCommittedResource(
-                    &heap, D3D12_HEAP_FLAG_NONE, &placeholder, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                    __uuidof(ID3D12Resource), &made);
-                if (SUCCEEDED(hr) && made) {
-                    auto* texture = static_cast<ID3D12Resource*>(made);
-                    register_at_address(address, texture);
-                    const D3D12_CPU_DESCRIPTOR_HANDLE dst{static_cast<SIZE_T>(handle)};
-                    if (unordered)
-                        self->real->CreateUnorderedAccessView(
-                            texture, nullptr, reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(words), dst);
-                    else
-                        self->real->CreateShaderResourceView(
-                            texture, reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(words), dst);
-                    texture->Release();  // the address map holds its reference
-                    static std::atomic<int> said{0};
-                    if (said.fetch_add(1) < 8)
-                        std::fprintf(stderr,
-                                     "[rt] d3d12_xs: view of texture memory at 0x%llx: 1x1 %s placeholder (data not "
-                                     "bound yet)\n",
-                                     static_cast<unsigned long long>(address), unordered ? "UAV" : "SRV");
-                    return;
-                }
-                static std::atomic<int> failed{0};
-                if (failed.fetch_add(1) < 8)
-                    std::fprintf(stderr,
-                                 "[rt] d3d12_xs: 1x1 placeholder at 0x%llx refused: 0x%08lx (dimension %u, view "
-                                 "dimension %u, format %u)\n",
-                                 static_cast<unsigned long long>(address), static_cast<unsigned long>(hr),
-                                 static_cast<unsigned>(placeholder.Dimension), static_cast<unsigned>(view_dimension),
-                                 static_cast<unsigned>(format));
-            }
-        }
-    }
+    // descriptor.rs and descriptor/host.rs, facts only). Every view goes to the layer's hook: it resolves a texture
+    // through the device's own registry of textures at title addresses (made by slot 133 or lazily at the address
+    // the view names), and makes a buffer at the address when it has none. The proxy keeps no texture of its own, so
+    // no view of one is intercepted here.
     const CreatePlacedViewFn create = g_create_placed_view.load(std::memory_order_acquire);
     if (!create) {
         static std::atomic<bool> said{false};
@@ -2473,50 +2353,40 @@ std::uint64_t proxy_struct_return(std::uint64_t rcx, std::uint64_t rdx, std::uin
 // Device slot 133: (address, D3D12_RESOURCE_DESC1*, barrier layout, clear value, riid, out) (game_scarlett_master.exe
 // 1.0.2.1 at exe+0x1e8684c, layout 0xffffffff = undefined; VIctory device.rs create_at_address and XCL device_x.rs
 // create_placed_resource_layout_x read the same shape). D3D12_RESOURCE_DESC1 begins with D3D12_RESOURCE_DESC; its
-// sampler feedback region is not needed. The layout is not used: a buffer has none.
-HRESULT proxy_create_at_address(DeviceProxy* self, std::uint64_t address, std::uint64_t desc, std::uint64_t riid,
-                                std::uint64_t out) {
+// sampler feedback region is not needed. The third argument is a D3D12_BARRIER_LAYOUT and the fourth the clear value:
+// the layer takes them for textures and ignores both for buffers, as the console does not need a barrier layout for a
+// buffer.
+HRESULT proxy_create_at_address(DeviceProxy* self, std::uint64_t address, std::uint64_t desc, std::uint64_t layout,
+                                std::uint64_t clear, std::uint64_t riid, std::uint64_t out) {
     note_slot(133);
     auto** result = reinterpret_cast<void**>(out);
     if (result) *result = nullptr;
     if (!desc || !riid || !result) return E_INVALIDARG;
     const auto* resource_desc = reinterpret_cast<const D3D12_RESOURCE_DESC*>(desc);
-    if (resource_desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
-        // A texture at the title's address: until a Vulkan image can be bound to that memory, make a committed
-        // resource with the description (the proxy's slot 76 path translates the console layout and flags), keep it
-        // under the address for slots 70/71's views, and say so once. The title's own memory is not used, so a write
-        // through the GPU VA rather than the resource object would not reach it.
-        D3D12_HEAP_PROPERTIES heap{};
-        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-        const HRESULT hr = proxy_create_resource(self, &heap, D3D12_HEAP_FLAG_NONE, resource_desc,
-                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                 reinterpret_cast<const IID*>(riid), result);
-        if (SUCCEEDED(hr) && *result) {
-            register_at_address(address, static_cast<ID3D12Resource*>(*result));
-            static std::atomic<bool> said{false};
-            if (!said.exchange(true))
-                std::fprintf(stderr,
-                             "[rt] d3d12_xs: texture at the title's address 0x%llx made as a committed resource "
-                             "(address not honoured yet)\n",
-                             static_cast<unsigned long long>(address));
-        } else {
-            static std::atomic<int> refused{0};
-            if (refused.fetch_add(1) < 12)
-                std::fprintf(stderr,
-                             "[rt] d3d12_xs: texture at 0x%llx refused: 0x%08lx (dimension %u, %llux%u, %u mips, "
-                             "format %u, flags 0x%x, layout %u)\n",
-                             static_cast<unsigned long long>(address), static_cast<unsigned long>(hr),
-                             static_cast<unsigned>(resource_desc->Dimension),
-                             static_cast<unsigned long long>(resource_desc->Width), resource_desc->Height,
-                             resource_desc->MipLevels, static_cast<unsigned>(resource_desc->Format),
-                             static_cast<unsigned>(resource_desc->Flags),
-                             static_cast<unsigned>(resource_desc->Layout));
-        }
-        return hr;
-    }
     const CreateAtAddressFn create = g_create_at_address.load(std::memory_order_acquire);
-    if (!create) return E_NOTIMPL;
-    return create(self->real, address, resource_desc, *reinterpret_cast<const IID*>(riid), result);
+    if (!create) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) std::fprintf(stderr, "[rt] d3d12_xs: resources at a title address have no backend\n");
+        return E_NOTIMPL;
+    }
+    const HRESULT hr = create(self->real, address, resource_desc, static_cast<D3D12_BARRIER_LAYOUT>(layout),
+                              reinterpret_cast<const D3D12_CLEAR_VALUE*>(clear), *reinterpret_cast<const IID*>(riid),
+                              result);
+    if (FAILED(hr) && resource_desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        static std::atomic<int> refused{0};
+        if (refused.fetch_add(1) < 12)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: texture at 0x%llx refused: 0x%08lx (dimension %u, %llux%u, %u mips, "
+                         "format %u, flags 0x%x, layout 0x%x, barrier layout 0x%x)\n",
+                         static_cast<unsigned long long>(address), static_cast<unsigned long>(hr),
+                         static_cast<unsigned>(resource_desc->Dimension),
+                         static_cast<unsigned long long>(resource_desc->Width), resource_desc->Height,
+                         resource_desc->MipLevels, static_cast<unsigned>(resource_desc->Format),
+                         static_cast<unsigned>(resource_desc->Flags),
+                         static_cast<unsigned>(static_cast<std::uint32_t>(resource_desc->Layout)),
+                         static_cast<unsigned>(static_cast<std::uint32_t>(layout)));
+    }
+    return hr;
 }
 
 template <unsigned Slot>
@@ -2580,7 +2450,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         proxy_create_placed_view(self, Slot == 71, a1, a2, a3);
         return 0;
     } else if constexpr (Slot == 133) {
-        return hr_to_u64(proxy_create_at_address(self, a1, a2, a5, a6));
+        return hr_to_u64(proxy_create_at_address(self, a1, a2, a3, a4, a5, a6));
     } else if constexpr (Slot == 25 || Slot == 26 || Slot == 43) {
         return proxy_struct_return<Slot>(reinterpret_cast<std::uint64_t>(self), a1, a2, a3, a4);
     } else if constexpr (Slot == 14) {

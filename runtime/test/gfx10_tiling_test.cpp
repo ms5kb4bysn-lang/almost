@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdio>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #define CHECK(condition) do {                                      \
@@ -140,6 +141,30 @@ int main() {
         CHECK(!TiledSurface2D::make(mode, 1, max, max, invalid));
         CHECK(!TiledSurface2D::make(mode, 1, 1, max, invalid));
     }
+    // The 256-byte modes (0x101 = SW_256B_S, 0x102 = SW_256B_D): the same round trips and bijections, and the
+    // block dimensions addrlib's GFX10_SW_256_* patterns give.
+    for (const auto mode : {TileMode::sw_256b_s, TileMode::sw_256b_d}) {
+        for (const std::size_t bpe : {1, 2, 4, 8, 16}) {
+            TiledSurface2D one;
+            CHECK(TiledSurface2D::make(mode, bpe, 1, 1, one));
+            CHECK(one.tiled_size() == 256);
+            CHECK(one.tile_width() * one.tile_height() * bpe == 256);
+            CHECK(check_surface(mode, bpe, 1, 1) == 0);
+            CHECK(check_surface(mode, bpe, 33, 17) == 0);
+            CHECK(check_surface(mode, bpe, 128, 64) == 0);
+            CHECK(check_surface(mode, bpe, one.tile_width() * 2, one.tile_height() * 3) == 0);
+        }
+    }
+    {
+        const std::pair<std::size_t, std::size_t> sizes[5] = {{16, 16}, {16, 8}, {8, 8}, {8, 4}, {4, 4}};
+        std::size_t i = 0;
+        for (const std::size_t bpe : {1, 2, 4, 8, 16}) {
+            TiledSurface2D one;
+            CHECK(TiledSurface2D::make(TileMode::sw_256b_s, bpe, 1, 1, one));
+            CHECK(one.tile_width() == sizes[i].first && one.tile_height() == sizes[i].second);
+            ++i;
+        }
+    }
     CHECK(invalid.tiled_size() == 0);
     std::size_t offset;
     CHECK(!invalid.element_offset(0, 0, offset));
@@ -150,6 +175,6 @@ int main() {
     std::vector<std::byte> tiled(surface.tiled_size()), linear(12);
     CHECK(!surface.tile(linear, tiled, max));
     CHECK(!surface.detile(tiled, linear, max));
-    std::puts("gfx10_tiling: 40 surface round trips, padded bijections, 30 Python offsets and invalid arguments passed");
+    std::puts("gfx10_tiling: 80 surface round trips, padded bijections, 30 Python offsets and invalid arguments passed");
     return 0;
 }

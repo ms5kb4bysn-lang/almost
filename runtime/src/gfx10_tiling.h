@@ -9,12 +9,26 @@
 
 namespace leonida::gfx10 {
 
-enum class TileMode { sw_4kb_s, sw_64kb_d };
+enum class TileMode { sw_256b_s, sw_256b_d, sw_4kb_s, sw_64kb_d };
 
 namespace tiling_detail {
 
-// Mesa addrlib GFX10_SW_4K_S_RBPLUS_PATINFO / GFX10_SW_64K_D_RBPLUS_PATINFO;
-// tools/ttpf_mips.py patterns, corpus validation in docs/textures.md. Zero bits address bytes within an element.
+// Mesa addrlib GFX10_SW_4K_S_RBPLUS_PATINFO / GFX10_SW_64K_D_RBPLUS_PATINFO /
+// GFX10_SW_256_S_RBPLUS / GFX10_SW_256_D_RBPLUS; tools/ttpf_mips.py patterns, corpus validation in
+// docs/textures.md. Zero bits address bytes within an element. The 256-byte patterns are the same hardware facts as
+// the 4 KiB and 64 KiB ones (addrlib's MICRO table): eight address bits, x and y coordinates or element bytes.
+inline constexpr int patterns_256_s[5][8] = {
+    {1, 2, 3, 4, -1, -2, -3, -4},          // x0..x3, y0..y3
+    {0, 1, 2, 3, -1, -2, -3, 4},           // element, x0..x2, y0..y2, x3
+    {0, 0, 1, 2, -1, -2, -3, 3},           // element x2, x0..x1, y0..y2, x2
+    {0, 0, 0, 1, -1, -2, 2, 3},            // element x3, x0, y0..y1, x1..x2
+    {0, 0, 0, 0, -1, -2, 1, 2}};           // element x4, y0..y1, x0..x1
+inline constexpr int patterns_256_d[5][8] = {
+    {1, 2, 3, -2, -1, -3, 4, -4},          // x0..x2, y1, y0, y2, x3, y3
+    {0, 1, 2, 3, -1, -2, -3, 4},           // same as the thin S pattern at 2 bytes
+    {0, 0, 1, 2, -1, -2, 3, -3},           // element x2, x0..x1, y0..y1, x2, y2
+    {0, 0, 0, 1, -1, 2, 3, -2},            // element x3, x0, y0, x1..x2, y1
+    {0, 0, 0, 0, 1, -1, 2, -2}};           // element x4, x0, y0, x1, y1
 inline constexpr int patterns_4k[5][12] = {
     {1, 2, 3, 4, -1, -2, -3, -4, -5, 5, -6, 6},
     {0, 1, 2, 3, -1, -2, -3, 4, -4, 5, -5, 6},
@@ -53,6 +67,14 @@ public:
         }
         TiledSurface2D next;
         switch (mode) {
+        case TileMode::sw_256b_s:
+            next.pattern_ = tiling_detail::patterns_256_s[index];
+            next.bits_ = 8;
+            break;
+        case TileMode::sw_256b_d:
+            next.pattern_ = tiling_detail::patterns_256_d[index];
+            next.bits_ = 8;
+            break;
         case TileMode::sw_4kb_s:
             next.pattern_ = tiling_detail::patterns_4k[index];
             next.bits_ = 12;

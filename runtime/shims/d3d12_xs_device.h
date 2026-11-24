@@ -94,10 +94,12 @@ ID3D12Device* device_proxy_real_device(const void* device);
 
 // Device slot 133 (CreatePlacedResourceX with a barrier layout: a resource at an address the title mapped itself) is
 // answered by the backend that registers here: the Vulkan layer, with its unified arena (rt::d3d12::
-// create_buffer_at_address). The proxy is also built without that layer (tests), so it is a hook; unset, slot 133 is
-// E_NOTIMPL.
+// create_buffer_at_address for buffers, create_texture_at_address for textures). The proxy is also built without that
+// layer (tests), so it is a hook; unset, slot 133 is E_NOTIMPL. `layout` is the console call's third argument, a
+// D3D12_BARRIER_LAYOUT (not a memory layout), and `clear` its fourth, the clear value (or null).
 using CreateAtAddressFn = HRESULT (*)(ID3D12Device* real, UINT64 address, const D3D12_RESOURCE_DESC* desc,
-                                      REFIID riid, void** out);
+                                      D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* clear, REFIID riid,
+                                      void** out);
 void set_create_at_address(CreateAtAddressFn fn);
 // Device slot 14 with a placed heap (the console description's address and size after the PC fields), answered by
 // the backend that registers here; unset, such a heap is created as a PC one.
