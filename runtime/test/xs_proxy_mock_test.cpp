@@ -86,13 +86,14 @@ struct Mock {
     Kind kind;
     long refs;
     int device_level;        // device: highest ID3D12DeviceN it answers (0 = ID3D12Device only)
+    int list_level;          // command_list: highest ID3D12GraphicsCommandListN it answers (0 = base list only)
     bool fence1;             // fence: answers ID3D12Fence1; device: the fences it makes do
     bool allocator_tag;      // allocator: answers kLeonidaCommandAllocatorTag; device: the allocators it makes do
     bool create_null;        // device: creation returns create_result with no object
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
     Mock* last_child;        // device: the object its last creation or open made
     unsigned calls[kMockSlots];
-    std::uint64_t args[kMockSlots][5];
+    std::uint64_t args[kMockSlots][6];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
     D3D12_COMMAND_QUEUE_DESC queue_desc; // device: the description its last CreateCommandQueue read
 };
@@ -150,9 +151,17 @@ bool mock_has(const Mock* m, REFIID iid) {
             return IsEqualIID(iid, __uuidof(ID3D12Fence)) || (m->fence1 && IsEqualIID(iid, __uuidof(ID3D12Fence1)));
         case Kind::resource: return IsEqualIID(iid, __uuidof(ID3D12Resource));
         case Kind::heap: return IsEqualIID(iid, __uuidof(ID3D12DescriptorHeap));
-        case Kind::command_list:
-            return IsEqualIID(iid, __uuidof(ID3D12CommandList)) ||
-                   IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList));
+        case Kind::command_list: {
+            if (IsEqualIID(iid, __uuidof(ID3D12CommandList)) ||
+                IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList)))
+                return true;
+            const IID levels[] = {__uuidof(ID3D12GraphicsCommandList1), __uuidof(ID3D12GraphicsCommandList2),
+                                  __uuidof(ID3D12GraphicsCommandList3), __uuidof(ID3D12GraphicsCommandList4),
+                                  __uuidof(ID3D12GraphicsCommandList5), __uuidof(ID3D12GraphicsCommandList6)};
+            for (int i = 0; i < m->list_level && i < static_cast<int>(std::size(levels)); ++i)
+                if (IsEqualIID(iid, levels[i])) return true;
+            return false;
+        }
         case Kind::allocator:
             return IsEqualIID(iid, __uuidof(ID3D12CommandAllocator)) ||
                    (m->allocator_tag && IsEqualIID(iid, xs::kLeonidaCommandAllocatorTag));
@@ -179,6 +188,7 @@ HRESULT mock_create(Mock* device, Kind kind, std::uint64_t riid, std::uint64_t o
     Mock* child = new_mock(kind);
     child->fence1 = device->fence1;
     child->allocator_tag = device->allocator_tag;
+    child->list_level = device->list_level;
     device->last_child = child;
     return mock_query(child, reinterpret_cast<const IID*>(riid), out);
 }
@@ -277,8 +287,30 @@ HRESULT WINAPI mock_create_command_list(Mock* self, std::uint64_t node_mask, std
     *out = nullptr;
     if (self->create_null || FAILED(self->create_result)) return self->create_result;
     Mock* child = new_mock(Kind::command_list);
+    child->list_level = self->list_level;
     self->last_child = child;
     return mock_query(child, riid, out);
+}
+
+// PC ID3D12GraphicsCommandList::CopyTextureRegion takes six words after `this`, one more than the generic mock thunk
+// records: the source box is a6, the first stack argument.
+std::uint64_t WINAPI mock_copy_texture_region(Mock* self, std::uint64_t dst, std::uint64_t x, std::uint64_t y,
+                                              std::uint64_t z, std::uint64_t src, std::uint64_t box) {
+    ++self->calls[16];
+    const std::uint64_t words[] = {dst, x, y, z, src, box};
+    std::memcpy(self->args[16], words, sizeof(words));
+    return S_OK;
+}
+
+// PC ID3D12GraphicsCommandList1::OMSetDepthBounds takes two FLOAT arguments in XMM1/XMM2. The generic integer thunk
+// would record the untouched integer registers, so this entry keeps the float signature and records the bit patterns.
+void WINAPI mock_om_set_depth_bounds(Mock* self, float min, float max) {
+    ++self->calls[62];
+    std::uint32_t min_bits = 0, max_bits = 0;
+    std::memcpy(&min_bits, &min, sizeof(min_bits));
+    std::memcpy(&max_bits, &max, sizeof(max_bits));
+    self->args[62][0] = min_bits;
+    self->args[62][1] = max_bits;
 }
 
 template <std::size_t... I>
@@ -291,6 +323,8 @@ void** mock_vtable() {
     static const bool filled = [] {
         fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
         table[12] = reinterpret_cast<void*>(&mock_create_command_list);
+        table[16] = reinterpret_cast<void*>(&mock_copy_texture_region);
+        table[62] = reinterpret_cast<void*>(&mock_om_set_depth_bounds);
         return true;
     }();
     (void)filled;
@@ -304,9 +338,10 @@ using SlotFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::
                                       std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
 
 std::uint64_t raw(const void* object, unsigned slot, std::uint64_t a1 = 0, std::uint64_t a2 = 0,
-                  std::uint64_t a3 = 0, std::uint64_t a4 = 0, std::uint64_t a5 = 0, std::uint64_t a6 = 0) {
+                  std::uint64_t a3 = 0, std::uint64_t a4 = 0, std::uint64_t a5 = 0, std::uint64_t a6 = 0,
+                  std::uint64_t a7 = 0) {
     void* const* vtable = *reinterpret_cast<void* const* const*>(object);
-    return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(object), a1, a2, a3, a4, a5, a6, 0, 0, 0, 0, 0,
+    return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(object), a1, a2, a3, a4, a5, a6, a7, 0, 0, 0, 0,
                                                   0, 0, 0);
 }
 
@@ -1022,6 +1057,7 @@ int check_list_slot_map() {
     Mock* mock = nullptr;
     void* device = make_device(mock, 9, true);
     EXPECT(device);
+    mock->list_level = 6;  // the real list answers through ID3D12GraphicsCommandList6: 80 PC slots (DispatchMesh at 79)
     const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
     void* allocator = nullptr;
     EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK && xs::is_allocator_proxy(allocator));
@@ -1080,12 +1116,53 @@ int check_list_slot_map() {
     raw(list, 27, word(list));
     EXPECT(real->calls[27] == 1 && real->args[27][0] == word(real));
 
+    // console 70 OMSetDepthBounds(min, max) -> PC 62; its two arguments are FLOATs, so the proxy's entry keeps that
+    // calling convention (the generic word thunk would never read XMM1/XMM2).
+    using DepthBoundsFn = void(WINAPI*)(void*, float, float);
+    void* const* const vtable = *reinterpret_cast<void* const* const*>(list);
+    const unsigned calls62 = real->calls[62];
+    reinterpret_cast<DepthBoundsFn>(vtable[70])(list, 0.25f, 0.75f);
+    EXPECT(real->calls[62] == calls62 + 1 && real->calls[70] == 0);
+    EXPECT(static_cast<std::uint32_t>(real->args[62][0]) == 0x3e800000u &&
+           static_cast<std::uint32_t>(real->args[62][1]) == 0x3f400000u);
+
+    // console 80 DispatchX(x, y, z, flags) -> PC 14 Dispatch(x, y, z), with the flags word dropped.
+    raw(list, 80, 3, 5, 7, 0x8020);
+    EXPECT(real->calls[14] == 1 && real->calls[80] == 0 && real->args[14][0] == 3 && real->args[14][1] == 5 &&
+           real->args[14][2] == 7 && real->args[14][3] == 0);
+
+    // console 85 CopyTextureRegionX(dst, x, y, z, src, box, flags) -> PC 16 CopyTextureRegion, same positions for
+    // the two locations, the coordinates and the box; the trailing flags word is dropped.
+    D3D12_TEXTURE_COPY_LOCATION dst_location{}, src_location{};
+    D3D12_BOX box{1, 2, 3, 4, 5, 6};
+    raw(list, 85, word(&dst_location), 7, 8, 9, word(&src_location), word(&box), 0x40);
+    EXPECT(real->calls[16] == 1 && real->calls[85] == 0 && real->args[16][0] == word(&dst_location) &&
+           real->args[16][1] == 7 && real->args[16][2] == 8 && real->args[16][3] == 9 &&
+           real->args[16][4] == word(&src_location) && real->args[16][5] == word(&box));
+
+    // console 86 CopyResourceX(dst, src, flags) -> PC 17 CopyResource(dst, src), with the flags word dropped.
+    raw(list, 86, 0x1111, 0x2222, 0x40);
+    EXPECT(real->calls[17] == 1 && real->calls[86] == 0 && real->args[17][0] == 0x1111 &&
+           real->args[17][1] == 0x2222 && real->args[17][2] == 0);
+
+    // console 100 DispatchMeshX(x, y, z, flags) -> PC 79 DispatchMesh; 129 (base layout DispatchMesh) already did.
+    raw(list, 100, 4, 5, 6, 0x20);
+    EXPECT(real->calls[79] == 1 && real->calls[100] == 0 && real->args[79][0] == 4 && real->args[79][1] == 5 &&
+           real->args[79][2] == 6 && real->args[79][3] == 0);
+    raw(list, 129, 7, 8, 9);
+    EXPECT(real->calls[79] == 2 && real->args[79][0] == 7 && real->args[79][1] == 8 && real->args[79][2] == 9);
+
     // 131/132 (syncs) and 142 (state flush): no-ops that reach nothing.
     before = total_calls(real);
     EXPECT(raw(list, 131, 1, 2, 3, 4) == 0 && raw(list, 132, 1, 2, 3, 4) == 0 && raw(list, 142, 5) == 0);
     EXPECT(total_calls(real) == before);
-    // Console-only or unmapped slots: 0 and nothing reached.
-    EXPECT(raw(list, 59, 1) == 0 && raw(list, 60, 1) == 0 && raw(list, 100, 1) == 0);
+    // Console-only or unmapped slots: 0 and nothing reached. 62/63/64/65 (memory copy/fill), 71/72 (address writes),
+    // 73/74 (address waits) and 83 (an indexed draw from a VA) have no PC equivalent; 59/60 are the newer layout's
+    // two unnamed additions.
+    EXPECT(raw(list, 59, 1) == 0 && raw(list, 60, 1) == 0 && raw(list, 62, 1, 2, 3, 4) == 0 &&
+           raw(list, 63, 1, 2, 3) == 0 && raw(list, 64, 1, 2, 3) == 0 && raw(list, 65, 1, 2, 3) == 0 &&
+           raw(list, 71, 1, 2, 3, 4) == 0 && raw(list, 72, 1, 2, 3, 4) == 0 && raw(list, 73, 1, 2, 3, 4) == 0 &&
+           raw(list, 74, 1, 2, 3, 4) == 0 && raw(list, 83, 1, 2, 3, 4) == 0);
     EXPECT(total_calls(real) == before);
     // 146 (barrier groups): one global UAV barrier through the PC list's ResourceBarrier (slot 26).
     const unsigned calls26 = real->calls[26];
@@ -1109,8 +1186,10 @@ int check_list_slot_map() {
     EXPECT(release(allocator) == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: console list slots reach their PC slots (32->28 heaps unwrapped, 28->52, 29->53, 50->46, 51->47, "
-                "61->59, 139->10 allocator unwrapped, 146->one UAV barrier); 131/132/142 and console-only slots reach "
-                "nothing\n", g_label);
+                "61->59, 70->62 with float arguments, 80->14, 85->16 with the box, 86->17, 100/129->79 with flags "
+                "dropped, 139->10 allocator unwrapped, 146->one UAV barrier); 131/132/142 and the memory copy/fill, "
+                "address write/wait and DrawIndexedX slots reach nothing\n",
+                g_label);
     return 0;
 }
 

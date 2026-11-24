@@ -1501,6 +1501,13 @@ HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out) {
 //   (SetDescriptorHeaps .. OMSetRenderTargets), 51-54 = PC 47-50 (the clears), 55 = PC 51 (DiscardResource),
 //   56-58 = PC 56-58 (markers), 59 = PC 59 (ExecuteIndirect); later console slots are mostly console-only, and
 //   127 is DispatchMesh (PC 79).
+// The console also has methods of its own that do map to a PC method when the extra word is dropped:
+//   68 OMSetDepthBounds (newer 70) = PC 62, 78 DispatchX (newer 80) = PC 14, 83 CopyTextureRegionX (newer 85) =
+//   PC 16, 84 CopyResourceX (newer 86) = PC 17, 98 DispatchMeshX (newer 100) = PC 79. The copy locations, box and
+//   dispatch counts sit in the same argument positions as the PC call; only a trailing flags word is extra.
+// Slot 20 IASetPrimitiveTopology keeps the PC slot but not every console value: 17 is the console's rect list, which
+// has no PC enum value. The layer has no rect-list path either (vulkan_topology() maps an unknown value to triangle
+// list), so the value is forwarded unchanged and the difference is left documented here rather than guessed at.
 // Slots 31 and 53-55 are inferred from the gaps (VIctory names their neighbours). game_scarlett_master.exe 1.0.2.1 uses
 // the newer layout, with two more methods at 59/60, so its slot s >= 61 is base slot s - 2 (VIctory: ExecuteIndirect
 // at 0x1e8, syncs at 0x418/0x420 = 131/132, ResetX at 0x458 = 139); it called 131 and 132 at boot.
@@ -1518,11 +1525,18 @@ constexpr int list_pc_slot(unsigned console) {
     if (console == 59 || console == 60) return kListConsoleOnly;   // the newer layout's two additions
     const unsigned base = console - 2;
     if (base == 59) return 59;                                     // ExecuteIndirect
+    if (base == 68) return 62;                                     // OMSetDepthBounds (FLOAT, FLOAT)
+    if (base == 78) return 14;                                     // DispatchX (x, y, z, flags)
+    if (base == 83) return 16;                                     // CopyTextureRegionX (..., box, flags)
+    if (base == 84) return 17;                                     // CopyResourceX (dst, src, flags)
+    if (base == 98) return 79;                                     // DispatchMeshX (x, y, z, flags)
     if (base == 127) return 79;                                    // DispatchMesh
     return kListConsoleOnly;
 }
 static_assert(list_pc_slot(28) == 52 && list_pc_slot(32) == 28 && list_pc_slot(50) == 46 && list_pc_slot(51) == 47 &&
-              list_pc_slot(61) == 59 && list_pc_slot(129) == 79 && list_pc_slot(131) == kListConsoleOnly);
+              list_pc_slot(61) == 59 && list_pc_slot(70) == 62 && list_pc_slot(80) == 14 && list_pc_slot(85) == 16 &&
+              list_pc_slot(86) == 17 && list_pc_slot(100) == 79 && list_pc_slot(129) == 79 &&
+              list_pc_slot(131) == kListConsoleOnly);
 
 // Console-only list methods with a known shape (newer layout slots).
 constexpr unsigned kListSyncTop = 131, kListSyncBottom = 132;  // (flags, control, address, size): no PC equivalent
@@ -1530,6 +1544,50 @@ constexpr unsigned kListResetX = 139;                          // (allocator, pi
 constexpr unsigned kListStateFlush = 142;                      // (u64), result unused by the title's state flush
 constexpr unsigned kListBarrierGroups = 146;                   // enhanced barriers (group count, groups)
 constexpr unsigned kListAllocateUpload = 148;                  // (size, alignment) -> pointer, null on failure
+
+// The console methods the proxy cannot forward, named with their argument shape for the once-per-slot log. A slot
+// that is only past the real list's PC table (a mapped extension on a shorter list) also lands here.
+constexpr const char* list_method_name(unsigned slot) {
+    switch (slot) {
+        case 62: return "CopyMemoryToMemoryX(dst VA, src VA, size, flags)";
+        case 63: return "FillMemoryWith32BitValueX(address, size, value)";
+        case 64: return "FillMemoryWith64BitValueX(address, size, value)";
+        case 65: return "FillMemoryWith128BitValueX(address, size, value*)";
+        case 71: return "Write32BitValueBottomOfPipeX(address, value, flush, flags)";
+        case 72: return "Write64BitValueBottomOfPipeX(address, value, flush, flags)";
+        case 73: return "Wait32BitValueX(address, compare, value, mask, flags)";
+        case 74: return "Wait64BitValueX(address, compare, value, flags)";
+        case 80: return "DispatchX(x, y, z, flags)";
+        case 83: return "DrawIndexedX(index VA, format, count, flags)";
+        case 85: return "CopyTextureRegionX(dst, x, y, z, src, box, flags)";
+        case 86: return "CopyResourceX(dst, src, flags)";
+        case 90: return "Write32BitValueTopOfPipeX(address, value, flags)";
+        case 91: return "Write64BitValueTopOfPipeX(address, value, flags)";
+        case 92: return "Write32BitValueBottomOfShaderX(address, value, stage)";
+        case 100: return "DispatchMeshX(x, y, z, flags)";
+        default: return "console method";
+    }
+}
+
+// Xbox list slot 70, OMSetDepthBounds(min, max): the PC list's ID3D12GraphicsCommandList1 method at slot 62, with the
+// same two FLOAT arguments. The generic list_slot thunk takes integer words and would never read XMM1/XMM2, so this
+// entry keeps the float signature the title calls with.
+std::uint64_t WINAPI list_depth_bounds(ListProxy* self, float min, float max) {
+    note_list_slot(70);
+    constexpr unsigned pc = 62;
+    if (!self->real || self->slot_count <= pc) {
+        static std::atomic<bool> warned{false};
+        if (first_call(warned))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: list slot 70 OMSetDepthBounds(%.3f, %.3f) is past the real list's %u PC "
+                         "slots; dropped\n",
+                         min, max, self->slot_count);
+        return 0;
+    }
+    using Fn = void(WINAPI*)(void*, float, float);
+    reinterpret_cast<Fn>(self->real_vtable[pc])(self->real, min, max);
+    return 0;
+}
 
 template <unsigned Slot>
 std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
@@ -1571,14 +1629,24 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             constexpr int pc = list_pc_slot(Slot);
             // Logged once per slot with its arguments; 0, not E_NOTIMPL, because a method that returns a pointer
             // (148, the upload allocator) had its result written through (VIctory).
+            // 62-65 (CopyMemoryToMemoryX, FillMemoryWith32/64/128BitValueX) take title VAs. The PC list copies only
+            // between ID3D12Resource objects (CopyBufferRegion), and the proxy has no VA-to-resource map; a CPU
+            // memcpy/memset at record time would also not be ordered against earlier and later GPU work.
+            // 71/72 (Write*BottomOfPipeX) and 73/74 (Wait*BitValueX) write or compare at a GPU address. The PC
+            // WriteBufferImmediate (GCL2 slot 63) also targets an ID3D12Resource, and no PC method waits on memory.
+            // Both groups need a replay-side address command in the layer; until one exists they stay no-ops.
+            // 90/91/92 are the same address writes at the top of the pipe and bottom of the shader.
+            // 83 DrawIndexedX draws from an index buffer VA and format, which is not the PC DrawIndexedInstanced's
+            // index-buffer view shape.
             const auto refuse = [&](const char* why) -> std::uint64_t {
                 static std::atomic<bool> warned{false};
                 if (first_call(warned))
                     std::fprintf(stderr,
-                                 "[rt] d3d12_xs: list slot %u (%s) is not implemented; returning 0 (args 0x%llx 0x%llx "
-                                 "0x%llx 0x%llx)\n",
-                                 Slot, why, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
-                                 static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+                                 "[rt] d3d12_xs: list slot %u [%s] %s; returning 0 (args 0x%llx 0x%llx 0x%llx "
+                                 "0x%llx)\n",
+                                 Slot, list_method_name(Slot), why, static_cast<unsigned long long>(a1),
+                                 static_cast<unsigned long long>(a2), static_cast<unsigned long long>(a3),
+                                 static_cast<unsigned long long>(a4));
                 return 0;
             };
             if constexpr (pc == kListConsoleOnly) {
@@ -1586,26 +1654,42 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             } else {
                 if (static_cast<unsigned>(pc) >= self->slot_count) return refuse("past the PC list");
                 auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[pc]);
+                // The console's extended dispatch and copy methods end in a flags word the PC target does not take;
+                // clear the words from the PC arity on, so no stale value reaches the real list.
+                constexpr unsigned pc_words = Slot == 80 || Slot == 100 ? 3u : Slot == 86 ? 2u : Slot == 85 ? 6u : 14u;
+                std::uint64_t words[14] = {a1,  a2,  a3,  a4,  a5,  a6,  a7,
+                                           a8,  a9,  a10, a11, a12, a13, a14};
+                for (unsigned i = pc_words; i < 14; ++i) words[i] = 0;
                 // The three PC list methods that take objects this proxy wraps: Reset(allocator, state),
                 // ExecuteBundle(list) and SetDescriptorHeaps(count, heaps).
                 if constexpr (pc == 10 || pc == 27) {
                     if constexpr (pc == 10) free_upload_memory(self);  // Reset ends the upload blocks' life
-                    a1 = unwrap_object(a1);
+                    words[0] = unwrap_object(a1);
                 } else if constexpr (pc == 28) {
                     UnwrappedArray heaps;
                     if (!heaps.fill(a2, a1)) return 0;
-                    const std::uint64_t unwrapped = heaps.data() ? heaps.data() : a2;
-                    return fn(self->real, a1, unwrapped, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+                    if (heaps.data()) words[1] = heaps.data();
                 }
-                return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+                return fn(self->real, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
+                          words[8], words[9], words[10], words[11], words[12], words[13]);
             }
         }
     }
 }
 
+// The table entry for a console slot: slot 70's arguments are FLOATs and need their own thunk; the rest share the
+// integer-word signature.
+template <unsigned Slot>
+void* list_slot_entry() {
+    if constexpr (Slot == 70)
+        return reinterpret_cast<void*>(&list_depth_bounds);
+    else
+        return reinterpret_cast<void*>(&list_slot<Slot>);
+}
+
 template <std::size_t... I>
 void fill_list_vtable(void** vtable, std::index_sequence<I...>) {
-    ((vtable[I] = reinterpret_cast<void*>(&list_slot<static_cast<unsigned>(I)>)), ...);
+    ((vtable[I] = list_slot_entry<static_cast<unsigned>(I)>()), ...);
 }
 
 void** get_list_vtable() {
