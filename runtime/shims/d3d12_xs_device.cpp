@@ -21,7 +21,11 @@
 // ABI); the generic thunk routes them before it forwards anything: 48 CreateCommandQueueX, 73 CreateCommandListX,
 // 78 SetFrameIntervalX, 79 ScheduleFrameEventX and 80 WaitFrameEventX. The slots can be moved with LEONIDA_XS_*_SLOT
 // for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
-// behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
+// behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token. Once
+// the Vulkan layer registers set_present_x/set_frame_event_callbacks (d3d12_vulkan_device.cpp, static init), queue
+// slot 32 (PresentX) presents to its window and the frame-event calls go to the same XboxPresentation, whose
+// FramePacer then issues the tokens PresentX carries; a callback that returns S_FALSE means no presentation yet and
+// leaves the first-frame behaviour below in place.
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
 #include "unified_memory.h"                 // rt::unified: upload memory at a title address (list slot 148)
@@ -94,6 +98,12 @@ struct HeapProxy {
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
 std::atomic<bool> g_first[kMaxSlots];
 std::atomic<bool> g_beyond_warned[kMaxSlots];
+// Queue slot 32 and device slots 78/79/80 reach the presentation through these (d3d12_xs_device.h). They are set at
+// the Vulkan layer's static init and are null in the proxy's own tests, which is the headless path.
+std::atomic<PresentXFn> g_present_x{nullptr};
+std::atomic<SetFrameIntervalXFn> g_set_frame_interval_x{nullptr};
+std::atomic<ScheduleFrameEventXFn> g_schedule_frame_event_x{nullptr};
+std::atomic<WaitFrameEventXFn> g_wait_frame_event_x{nullptr};
 std::atomic<std::uint64_t> g_heap_hits[kHeapSlots];
 std::atomic<bool> g_heap_first[kHeapSlots];
 // The hit counters are for tests. They count from the first call of a *_slot_hits reader or of
@@ -1149,6 +1159,15 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                 // the buffer). [V] and [X] disagree on the newer layout's number (20 or 28); answer both.
                 return pc_call(18, a1, 0);
             } else if constexpr (Slot == 32) {
+                // PresentX(plane count, planes, params). With the Vulkan layer's presentation registered, the frame
+                // goes to its window; without one (tests, headless) the first-frame answer stays: logged once, S_OK.
+                const PresentXFn present = g_present_x.load(std::memory_order_acquire);
+                if (present) {
+                    const HRESULT hr = present(self->device ? self->device->real : nullptr,
+                                               static_cast<UINT>(a1), reinterpret_cast<const void*>(a2),
+                                               reinterpret_cast<const void*>(a3));
+                    return hr_to_u64(hr);
+                }
                 said("PresentX: no presenter connected yet, accepted");
                 return hr_to_u64(S_OK);
             } else if constexpr (Slot == 14 || Slot == 15 || Slot == 23 || Slot == 24 || Slot == 31) {
@@ -1345,9 +1364,17 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
 // Xbox device slot 78 (public HLE): SetFrameIntervalX(output, interval_us, latency, flags). The output and flags are
 // not used before a presenter exists. The period is a vblank period in microseconds in the public samples (16667 for
 // 60 Hz), and latency is the allowed frames in flight. S_OK even for 0: a boot must not abort here, and nothing paces.
+// When the Vulkan layer has a presentation for the device, its pacer is configured instead and it answers; S_FALSE
+// from the callback means no presentation (yet), and the first-frame state below is kept.
 HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std::uint64_t interval_us,
                                    std::uint64_t latency, std::uint64_t flags) {
     (void)output;
+    const SetFrameIntervalXFn callback = g_set_frame_interval_x.load(std::memory_order_acquire);
+    if (callback) {
+        const HRESULT hr = callback(self->real, static_cast<UINT>(interval_us), static_cast<UINT>(latency),
+                                    static_cast<UINT>(flags));
+        if (hr != S_FALSE) return hr;
+    }
     (void)flags;
     self->frame_interval_us.store(static_cast<std::uint32_t>(interval_us), std::memory_order_relaxed);
     self->frame_latency.store(static_cast<std::uint32_t>(latency ? latency : 1), std::memory_order_relaxed);
@@ -1355,8 +1382,15 @@ HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std:
 }
 
 // Xbox device slot 79 (public HLE): ScheduleFrameEventX(event, offset_us, pEvent, flags); our pacer has only the origin.
+// S_FALSE from the callback means no presentation (yet): the first-frame flag below is set instead.
 HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t offset_us,
                                      std::uint64_t flags) {
+    const ScheduleFrameEventXFn callback = g_schedule_frame_event_x.load(std::memory_order_acquire);
+    if (callback) {
+        const HRESULT hr = callback(self->real, static_cast<UINT>(event), static_cast<UINT>(offset_us),
+                                    static_cast<UINT>(flags));
+        if (hr != S_FALSE) return hr;
+    }
     (void)event;
     (void)offset_us;
     (void)flags;
@@ -1364,16 +1398,24 @@ HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std
     return S_OK;
 }
 
-// Xbox device slot 80 (public HLE): WaitFrameEventX(event, timeout_ms, pEvent, flags, &token). It returns at once with
-// a fresh non-zero token (the first-frame choice): there is no vblank source behind the device before a presenter, and
-// a zero wait cannot stall the title. A null token pointer is E_POINTER, as a _Out_ parameter.
+// Xbox device slot 80 (public HLE): WaitFrameEventX(event, timeout_ms, pEvent, flags, &token). With a presentation the
+// pacer waits for the next origin and issues the token, and while `latency` frames are in flight. Without one (the
+// callback's S_FALSE) it returns at once with a fresh non-zero token (the first-frame choice): there is no vblank
+// source behind the device before a presenter, and a zero wait cannot stall the title. A null token pointer is
+// E_POINTER, as a _Out_ parameter.
 HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t timeout_ms,
                                  std::uint64_t flags, std::uint64_t token_word) {
+    auto* token = reinterpret_cast<std::uint64_t*>(token_word);
+    if (!token) return E_POINTER;
+    const WaitFrameEventXFn callback = g_wait_frame_event_x.load(std::memory_order_acquire);
+    if (callback) {
+        const HRESULT hr = callback(self->real, static_cast<UINT>(event), static_cast<UINT>(timeout_ms),
+                                    static_cast<UINT>(flags), token);
+        if (hr != S_FALSE) return hr;
+    }
     (void)event;
     (void)timeout_ms;
     (void)flags;
-    auto* token = reinterpret_cast<std::uint64_t*>(token_word);
-    if (!token) return E_POINTER;
     std::uint64_t value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);
     if (value == 0) value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);  // skip the null token
     *token = value;
@@ -2793,6 +2835,14 @@ void set_create_at_address(CreateAtAddressFn fn) { g_create_at_address.store(fn,
 void set_create_heap_at(CreateHeapAtFn fn) { g_create_heap_at.store(fn, std::memory_order_release); }
 
 void set_create_placed_view(CreatePlacedViewFn fn) { g_create_placed_view.store(fn, std::memory_order_release); }
+
+void set_present_x(PresentXFn fn) { g_present_x.store(fn, std::memory_order_release); }
+
+void set_frame_event_callbacks(SetFrameIntervalXFn interval, ScheduleFrameEventXFn schedule, WaitFrameEventXFn wait) {
+    g_set_frame_interval_x.store(interval, std::memory_order_release);
+    g_schedule_frame_event_x.store(schedule, std::memory_order_release);
+    g_wait_frame_event_x.store(wait, std::memory_order_release);
+}
 
 ID3D12GraphicsCommandList* list_proxy_real_list(const void* list) {
     if (!is_list_proxy_object(list)) return nullptr;

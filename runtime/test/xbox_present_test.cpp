@@ -1336,6 +1336,50 @@ int main() {
             EXPECT(shown);
             std::printf("minimised: %d of 3 presents skipped and not read back; restored: shown again\n", skipped_presents);
         }
+        // A 4K source plane into a 1080p window goes through the presenter's scaling path: the swapchain follows
+        // the window's client area (1920x1080 here) and the plain blit stretches the whole 3840x2160 texture onto
+        // it. Neither size is assumed: the window is resized here and the presenter recreates its swapchain.
+        {
+            RECT outer{0, 0, 1920, 1080};
+            AdjustWindowRect(&outer, WS_OVERLAPPEDWINDOW, FALSE);
+            SetWindowPos(window, nullptr, 0, 0, outer.right - outer.left, outer.bottom - outer.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            pump();
+            Source big;
+            EXPECT(make_source(DXGI_FORMAT_R8G8B8A8_UNORM, big, 3840, 2160));
+            const FLOAT white[4] = {1, 1, 1, 1};
+            const FLOAT* quadrant_colours[4] = {red, green, blue, white};
+            const D3D12_RECT quadrant_rects[4] = {{0, 0, 1920, 1080}, {1920, 0, 3840, 1080},
+                                                   {0, 1080, 1920, 2160}, {1920, 1080, 3840, 2160}};
+            for (int i = 0; i < 4; ++i) EXPECT(fill(big, quadrant_colours[i], 1, &quadrant_rects[i]));
+            bool scaled_4k = false;
+            for (int round = 0; round < 4 && !scaled_4k; ++round) {
+                EXPECT(next_token(token));
+                auto big_plane = plane_of(big, token);
+                const std::uint64_t blits_before = xbox.presenter().composed_presents();
+                EXPECT(xbox.PresentX(1, &big_plane, nullptr) == S_OK);
+                EXPECT(xbox.presenter().composed_presents() == blits_before);  // the blit path, not the compose pass
+                Frame scaled;
+                if (!xbox.presenter().read_back(scaled.bytes, &scaled.extent, &scaled.format)) continue;
+                if (scaled.extent.width != 1920 || scaled.extent.height != 1080) {
+                    clock.advance_us(4 * period);  // still the old swapchain: resize it on the next present
+                    continue;
+                }
+                scaled_4k = true;
+                const Px centres[4] = {{255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 255}};
+                const UINT centre_x[4] = {480, 1440, 480, 1440}, centre_y[4] = {270, 270, 810, 810};
+                for (int i = 0; i < 4; ++i) EXPECT(close_to(scaled.at(centre_x[i], centre_y[i]), centres[i], 1));
+                std::printf("4K source (3840x2160) into a 1080p window: swapchain %ux%u, quadrant centres scaled: "
+                            "ok\n", scaled.extent.width, scaled.extent.height);
+            }
+            EXPECT(scaled_4k);
+            // Back to the 320x240 client for the shutdown blank.
+            RECT restored{0, 0, LONG(width), LONG(height)};
+            AdjustWindowRect(&restored, WS_OVERLAPPEDWINDOW, FALSE);
+            SetWindowPos(window, nullptr, 0, 0, restored.right - restored.left, restored.bottom - restored.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            pump();
+        }
         EXPECT(real.PresentX(0, nullptr, nullptr) == S_OK);  // the shutdown blank
     }
     DestroyWindow(window);

@@ -9,6 +9,8 @@
 //   - allocation failures in the proxy (operator new, the arrays it unwraps), injected in this executable only;
 //   - struct-returning slots 25/26/43 with the return pointer in RCX (the title's order) or RDX, console queue flags,
 //     the list proxy's console-to-PC slot map, and the slot 133 / placed-heap (slot 14) backend hooks;
+//   - queue slot 32 (PresentX) and device slots 78/79/80 through their registered callbacks, and their first-frame
+//     fallbacks without one;
 //   - --fail-virtualalloc / --fail-virtualprotect / --fail-veh: the guard region's setup failing, injected by
 //     patching this executable's own import table before the first proxy table is built (one process each).
 // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
@@ -842,6 +844,142 @@ int check_xbox_slots() {
 #endif
 }
 
+// ---- 7a. Queue slot 32 (PresentX) and the frame-event callbacks ----
+
+struct PresentXCall {
+    unsigned calls;
+    ID3D12Device* real;
+    UINT plane_count;
+    const void* planes;
+    const void* params;
+    HRESULT result;
+};
+PresentXCall g_present_x{};
+
+HRESULT test_present_x(ID3D12Device* real, UINT plane_count, const void* planes, const void* params) {
+    ++g_present_x.calls;
+    g_present_x.real = real;
+    g_present_x.plane_count = plane_count;
+    g_present_x.planes = planes;
+    g_present_x.params = params;
+    return g_present_x.result;
+}
+
+struct FrameEventCall {
+    unsigned calls;
+    ID3D12Device* real;
+    UINT event, offset_or_timeout, flags;
+    std::uint64_t token;
+    HRESULT result;
+};
+FrameEventCall g_interval_x{}, g_schedule_event_x{}, g_wait_event_x{};
+
+HRESULT test_set_frame_interval_x(ID3D12Device* real, UINT interval_us, UINT latency, UINT flags) {
+    ++g_interval_x.calls;
+    g_interval_x.real = real;
+    g_interval_x.event = interval_us;
+    g_interval_x.offset_or_timeout = latency;
+    g_interval_x.flags = flags;
+    return g_interval_x.result;
+}
+
+HRESULT test_schedule_frame_event_x(ID3D12Device* real, UINT event, UINT offset_us, UINT flags) {
+    ++g_schedule_event_x.calls;
+    g_schedule_event_x.real = real;
+    g_schedule_event_x.event = event;
+    g_schedule_event_x.offset_or_timeout = offset_us;
+    g_schedule_event_x.flags = flags;
+    return g_schedule_event_x.result;
+}
+
+HRESULT test_wait_frame_event_x(ID3D12Device* real, UINT event, UINT timeout_ms, UINT flags, std::uint64_t* token) {
+    ++g_wait_event_x.calls;
+    g_wait_event_x.real = real;
+    g_wait_event_x.event = event;
+    g_wait_event_x.offset_or_timeout = timeout_ms;
+    g_wait_event_x.flags = flags;
+    if (token) *token = g_wait_event_x.token;
+    return g_wait_event_x.result;
+}
+
+// The queue slot 32 callback, as the missing window in the tests is: the registered callback gets the real PC device
+// and the three PresentX arguments unchanged, its HRESULT comes back, and without one the first-frame S_OK stays. The
+// device slots 78/79/80 keep the fake tokens when their callback answers S_FALSE and take the callback's answer
+// otherwise.
+int check_present_x() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    void* queue = make_queue(device);
+    EXPECT(queue);
+    const unsigned calls32 = mock->calls[32];
+    const unsigned calls78 = mock->calls[78], calls79 = mock->calls[79], calls80 = mock->calls[80];
+
+    // No callback: the first-frame answer, logged once, and nothing reaches the PC queue.
+    EXPECT(hr_of(raw(queue, 32, 1, 0x1111, 0x2222)) == S_OK && mock->calls[32] == calls32);
+
+    g_present_x = PresentXCall{};
+    g_present_x.result = S_OK;
+    xs::set_present_x(&test_present_x);
+    EXPECT(hr_of(raw(queue, 32, 1, 0x1111, 0x2222)) == S_OK);
+    EXPECT(g_present_x.calls == 1 && g_present_x.real == reinterpret_cast<ID3D12Device*>(mock) &&
+           g_present_x.plane_count == 1 && g_present_x.planes == reinterpret_cast<const void*>(0x1111) &&
+           g_present_x.params == reinterpret_cast<const void*>(0x2222));
+    EXPECT(mock->calls[32] == calls32);  // PresentX never reaches the PC queue's slot 32
+
+    // A failure comes back as the callback answered it; no plane is still delivered (the layer refuses it).
+    g_present_x.result = E_FAIL;
+    EXPECT(hr_of(raw(queue, 32, 0, 0, 0)) == E_FAIL && g_present_x.calls == 2 && g_present_x.plane_count == 0);
+    g_present_x.result = DXGI_ERROR_UNSUPPORTED;
+    EXPECT(hr_of(raw(queue, 32, 3, 0x3333, 0)) == DXGI_ERROR_UNSUPPORTED && g_present_x.calls == 3 &&
+           g_present_x.plane_count == 3);
+    xs::set_present_x(nullptr);
+    g_present_x.result = E_FAIL;
+    EXPECT(hr_of(raw(queue, 32, 1, 0x4444, 0x5555)) == S_OK && g_present_x.calls == 3);
+
+    // Frame events: S_FALSE means no presentation, so the proxy's own first-frame answers and fresh tokens stay.
+    g_interval_x = FrameEventCall{};
+    g_schedule_event_x = FrameEventCall{};
+    g_wait_event_x = FrameEventCall{};
+    g_interval_x.result = g_schedule_event_x.result = g_wait_event_x.result = S_FALSE;
+    xs::set_frame_event_callbacks(&test_set_frame_interval_x, &test_schedule_frame_event_x, &test_wait_frame_event_x);
+    std::uint64_t token = 0, token2 = 0;
+    EXPECT(hr_of(raw(device, 78, 0, 16667, 2, 4)) == S_OK);
+    EXPECT(g_interval_x.calls == 1 && g_interval_x.real == reinterpret_cast<ID3D12Device*>(mock) &&
+           g_interval_x.event == 16667 && g_interval_x.offset_or_timeout == 2 && g_interval_x.flags == 4);
+    EXPECT(hr_of(raw(device, 79, 7, 100, 0x1234, 8)) == S_OK);
+    EXPECT(g_schedule_event_x.calls == 1 && g_schedule_event_x.event == 7 &&
+           g_schedule_event_x.offset_or_timeout == 100 && g_schedule_event_x.flags == 8);
+    EXPECT(hr_of(raw(device, 80, 7, 0xffffffffu, 0, 9, word(&token))) == S_OK && token != 0);
+    EXPECT(g_wait_event_x.calls == 1 && g_wait_event_x.event == 7 && g_wait_event_x.offset_or_timeout == 0xffffffffu &&
+           g_wait_event_x.flags == 9);
+    EXPECT(mock->calls[78] == calls78 && mock->calls[79] == calls79 && mock->calls[80] == calls80);
+
+    // A callback that has a presentation answers for the slot: its HRESULT and its token come back.
+    g_interval_x.result = g_schedule_event_x.result = g_wait_event_x.result = S_OK;
+    g_wait_event_x.token = 0xabcdef;
+    EXPECT(hr_of(raw(device, 78, 0, 33333, 1, 0)) == S_OK && g_interval_x.calls == 2);
+    EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK && g_schedule_event_x.calls == 2);
+    EXPECT(hr_of(raw(device, 80, 0, 16, 0, 0, word(&token2))) == S_OK && token2 == 0xabcdef &&
+           g_wait_event_x.calls == 2);
+    // The wait callback is not called for a null token pointer: that stays E_POINTER.
+    EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, 0)) == E_POINTER && g_wait_event_x.calls == 2);
+    g_wait_event_x.result = HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+    EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token2))) == HRESULT_FROM_WIN32(WAIT_TIMEOUT) &&
+           g_wait_event_x.calls == 3);
+
+    // Removed again: the fake-token path is back.
+    xs::set_frame_event_callbacks(nullptr, nullptr, nullptr);
+    EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token2))) == S_OK && token2 != 0 && g_wait_event_x.calls == 3);
+
+    EXPECT(release(queue) == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: queue slot 32 calls the registered PresentX with the real device and the same three arguments "
+                "and returns its HRESULT, and keeps S_OK without one; slots 78/79/80 take the callback's answer or "
+                "keep the fake token on S_FALSE\n", g_label);
+    return 0;
+}
+
 // ---- 8. Environment overrides for the Xbox device slots (one process each, read once) ----
 
 int run_env_slots(bool valid) {
@@ -1466,8 +1604,9 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_struct_returns() ||
-        check_queue_flags() || check_list_slot_map() || check_placed_hooks() || check_pipeline_slots())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_present_x() ||
+        check_struct_returns() || check_queue_flags() || check_list_slot_map() || check_placed_hooks() ||
+        check_pipeline_slots())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

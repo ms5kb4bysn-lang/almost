@@ -15,6 +15,9 @@
 //   slots 78/79/80  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX. A per-device token state machine answers
 //             them before the PC vtable is indexed; WaitFrameEventX returns at once with a fresh non-zero token.
 //             Slot 80 is outside a PC ID3D12Device11 table, so it is checked before the beyond-table refusal.
+//             The Vulkan layer registers set_frame_event_callbacks and set_present_x (see below): from then on the
+//             calls go to its XboxPresentation, whose FramePacer issues the tokens PresentX carries. Queue slot 32
+//             (the newer console layout) is the PresentX call that reaches the same presentation.
 // The slots 48/73/78/79/80 are the public HLE Freminet/ScarlettX's observation, not Microsoft documentation, and can
 // be moved with LEONIDA_XS_QUEUE_X_SLOT, LEONIDA_XS_LIST_X_SLOT, LEONIDA_XS_FRAME_INTERVAL_SLOT,
 // LEONIDA_XS_SCHEDULE_EVENT_SLOT and LEONIDA_XS_WAIT_EVENT_SLOT (3..127; anything else is logged once and ignored).
@@ -106,6 +109,26 @@ void set_create_heap_at(CreateHeapAtFn fn);
 using CreatePlacedViewFn = void (*)(ID3D12Device* real, bool unordered, const D3D12_RESOURCE_DESC* resource,
                                     const std::uint32_t* view, D3D12_CPU_DESCRIPTOR_HANDLE handle);
 void set_create_placed_view(CreatePlacedViewFn fn);
+
+// Queue slot 32 (the newer console layout): PresentX(plane_count, planes, params). `real` is the PC device behind the
+// queue's device proxy; `planes` points at the title's D3D12XBOX_PRESENT_PLANE_PARAMETERS array and `params` at its
+// D3D12XBOX_PRESENT_PARAMETERS (or null). The resources in the planes are this layer's ID3D12Resource objects and are
+// passed through unchanged. Registered by the layer that owns the presentation (d3d12_vulkan_device.cpp). Unset
+// (tests, headless), slot 32 keeps the first-frame behaviour: logged once and S_OK. The callback runs on the queue's
+// thread.
+using PresentXFn = HRESULT (*)(ID3D12Device* real, UINT plane_count, const void* planes, const void* params);
+void set_present_x(PresentXFn fn);
+
+// Device slots 78/79/80 (SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX): the same presentation's FramePacer,
+// which issues the tokens PresentX carries. Each callback returns S_FALSE when it has no presentation for `real` yet
+// (no window, a PC device behind the proxy, or a failed presenter): the proxy then keeps its first-frame fake-token
+// behaviour. Any other HRESULT is returned to the title. `token` is never null in the wait callback.
+using SetFrameIntervalXFn = HRESULT (*)(ID3D12Device* real, UINT interval_us, UINT latency, UINT flags);
+using ScheduleFrameEventXFn = HRESULT (*)(ID3D12Device* real, UINT event, UINT offset_us, UINT flags);
+using WaitFrameEventXFn = HRESULT (*)(ID3D12Device* real, UINT event, UINT timeout_ms, UINT flags,
+                                      std::uint64_t* token);
+// Any of the three may be null, in which case the proxy keeps that slot's first-frame behaviour.
+void set_frame_event_callbacks(SetFrameIntervalXFn interval, ScheduleFrameEventXFn schedule, WaitFrameEventXFn wait);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and

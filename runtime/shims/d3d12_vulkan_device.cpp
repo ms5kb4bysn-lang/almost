@@ -16,6 +16,7 @@
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
 #include "unified_memory.h"
+#include "xbox_present.h"
 #include "../src/arena_size.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
@@ -9184,6 +9185,188 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
     window_presenter->set_window(window);
     return window_presenter;
 }
+
+namespace {
+
+// One XboxPresentation per layer device, with the window it presents to: it owns the swapchain, a FramePacer and a
+// worker thread, so it lives for the process (a title creates one device). PresentX and the frame-event calls may
+// come from different threads.
+struct XboxPresentationEntry {
+    HWND window = nullptr;
+    std::unique_ptr<XboxPresentation> presentation;
+};
+
+struct XboxPresentations {
+    std::mutex mutex;
+    std::map<ID3D12Device*, XboxPresentationEntry> by_device;
+};
+
+XboxPresentations& xbox_presentations() {
+    static XboxPresentations presentations;
+    return presentations;
+}
+
+struct MainWindowSearch {
+    HWND largest = nullptr;  // the biggest visible, unowned, non-tool top-level window of this process
+    HWND first = nullptr;    // or the first such window, when none has a rectangle
+    LONG largest_area = 0;
+};
+
+BOOL CALLBACK find_process_window(HWND window, LPARAM param) {
+    auto& search = *reinterpret_cast<MainWindowSearch*>(param);
+    DWORD process = 0;
+    GetWindowThreadProcessId(window, &process);
+    if (process != GetCurrentProcessId() || !IsWindowVisible(window)) return TRUE;
+    if (GetWindow(window, GW_OWNER) || (GetWindowLongW(window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) ||
+        (GetWindowLongPtrW(window, GWL_STYLE) & WS_CHILD))
+        return TRUE;
+    if (!search.first) search.first = window;
+    RECT rect{};
+    if (!GetWindowRect(window, &rect)) return TRUE;
+    const LONG area = (rect.right - rect.left) * (rect.bottom - rect.top);
+    if (!search.largest || area > search.largest_area) {
+        search.largest = window;
+        search.largest_area = area;
+    }
+    return TRUE;
+}
+
+// The presentation entry for `real`, or null. `create` asks for one to be made when the device is this layer's and
+// the process has a window; `created` (when not null) says it was made by this call. A PC device behind the proxy has
+// no presenter, so the callbacks can return S_FALSE and leave the proxy's first-frame behaviour in place.
+XboxPresentationEntry* xbox_presentation_for(ID3D12Device* real, bool create, bool* created) {
+    if (created) *created = false;
+    if (!real) return nullptr;
+    XboxPresentations& presentations = xbox_presentations();
+    // The lock is held across the creation too: two threads that first call SetFrameIntervalX and PresentX at the
+    // same moment would otherwise each make a swapchain for the window. Creation happens once per process.
+    std::lock_guard lock(presentations.mutex);
+    const auto found = presentations.by_device.find(real);
+    if (found != presentations.by_device.end()) return &found->second;
+    if (!create) return nullptr;
+    if (!Device::from<Device>(real)) return nullptr;
+    MainWindowSearch search;
+    EnumWindows(&find_process_window, reinterpret_cast<LPARAM>(&search));
+    HWND window = search.largest ? search.largest : search.first;
+    if (!window) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr,
+                         "[rt] present: no visible top-level window of this process (pid %lu): PresentX cannot be "
+                         "connected until one exists\n",
+                         static_cast<unsigned long>(GetCurrentProcessId()));
+        return nullptr;
+    }
+    std::unique_ptr<WindowPresenter> presenter = create_window_presenter(real, window);
+    if (!presenter) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr, "[rt] present: no window presenter for window %p; PresentX is not connected\n",
+                         static_cast<void*>(window));
+        return nullptr;
+    }
+    RECT client{};
+    GetClientRect(window, &client);
+    std::fprintf(stderr, "[rt] present: presenting to window %p (%ldx%ld) on device %p\n", static_cast<void*>(window),
+                 static_cast<long>(client.right - client.left), static_cast<long>(client.bottom - client.top),
+                 static_cast<void*>(real));
+    XboxPresentationEntry entry;
+    entry.window = window;
+    entry.presentation = std::make_unique<XboxPresentation>(std::move(presenter));
+    const auto inserted = presentations.by_device.emplace(real, std::move(entry));
+    if (created) *created = true;
+    return &inserted.first->second;
+}
+
+// The three sizes that decide how a frame reaches the window, once at the first present: the window's client area
+// (what the swapchain is sized from), the swapchain extent itself, and the source texture of plane 0. A source larger
+// or smaller than the swapchain (3840x2160 planes on a 1920x1080 window, say) takes the presenter's scaling path; the
+// line makes that visible instead of leaving a black window unexplained. Nothing here assumes a desktop size.
+void log_first_present_sizes(const XboxPresentationEntry& entry, UINT plane_count,
+                             const XboxPresentPlaneParameters* planes) {
+    if (!plane_count || !planes || !planes->ppResources || !planes->ppResources[0]) return;  // a blank frame says nothing
+    static std::atomic<bool> said{false};
+    if (said.exchange(true)) return;
+    RECT client{};
+    GetClientRect(entry.window, &client);
+    const VkExtent2D swapchain = entry.presentation->presenter().extent();
+    const D3D12_RESOURCE_DESC desc = planes->ppResources[0]->GetDesc();
+    const UINT source_width = static_cast<UINT>(desc.Width);
+    const UINT source_height = desc.Height;
+    const bool scaled = source_width && source_height &&
+                        (source_width != swapchain.width || source_height != swapchain.height);
+    std::fprintf(stderr,
+                 "[rt] present: first frame: window client %ldx%ld, swapchain %ux%u, plane 0 source %ux%u%s\n",
+                 static_cast<long>(client.right - client.left), static_cast<long>(client.bottom - client.top),
+                 swapchain.width, swapchain.height, source_width, source_height,
+                 scaled ? " (scaled to the swapchain)" : "");
+}
+
+// Queue slot 32: PresentX(plane_count, planes, params). The plane and present structs keep the measured layouts from
+// xbox_present.h; the resources in them are this layer's own ID3D12Resource objects and are passed through as they
+// are. The presenter scales the plane to the swapchain extent (VulkanPresenter's blit, or present_planes' destination
+// rectangles), so a 4K plane in a 1080p window is not copied 1:1. When this call is what makes the presentation, the
+// pacer has not issued the frame's token (the frame-event calls ran on the proxy's fake-token path), so the planes are
+// copied with Token cleared: the null token is the documented "present anyway" case, and the first frame is shown
+// instead of refused.
+HRESULT xbox_present_x(ID3D12Device* real, UINT plane_count, const void* planes, const void* params) {
+    bool created = false;
+    XboxPresentationEntry* entry = xbox_presentation_for(real, true, &created);
+    if (!entry) {
+        // A device this layer did not make (the host D3D12 backend, or a null device) has no window path at all:
+        // keep the proxy's first-frame S_OK so a title does not abort on a present the port cannot show anyway.
+        if (!real || !Device::from<Device>(real)) {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr,
+                             "[rt] present: PresentX on a device without a Vulkan presenter: accepted without a frame "
+                             "(the host D3D12 path cannot present)\n");
+            return S_OK;
+        }
+        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
+    const auto* plane_parameters = static_cast<const XboxPresentPlaneParameters*>(planes);
+    const auto* present_parameters = static_cast<const XboxPresentParameters*>(params);
+    log_first_present_sizes(*entry, plane_count, plane_parameters);
+    if (!created || !plane_count || !plane_parameters || plane_count > 2)
+        return entry->presentation->PresentX(plane_count, plane_parameters, present_parameters);
+    XboxPresentPlaneParameters copy[2];
+    std::memcpy(copy, plane_parameters, plane_count * sizeof(copy[0]));
+    for (UINT i = 0; i < plane_count; ++i) copy[i].Token = 0;
+    return entry->presentation->PresentX(plane_count, copy, present_parameters);
+}
+
+// Device slots 78/79/80: the same presentation's pacer, so WaitFrameEventX issues the tokens PresentX carries.
+// S_FALSE means there is no presentation for this device yet and the proxy keeps its first-frame behaviour.
+HRESULT xbox_set_frame_interval_x(ID3D12Device* real, UINT interval_us, UINT latency, UINT flags) {
+    XboxPresentationEntry* entry = xbox_presentation_for(real, true, nullptr);
+    if (!entry) return S_FALSE;
+    if (interval_us == 0) return S_OK;  // nothing paces, as the proxy's own first-frame answer
+    return entry->presentation->SetFrameIntervalX(nullptr, interval_us, latency, flags);
+}
+
+HRESULT xbox_schedule_frame_event_x(ID3D12Device* real, UINT event, UINT offset_us, UINT flags) {
+    XboxPresentationEntry* entry = xbox_presentation_for(real, false, nullptr);
+    if (!entry) return S_FALSE;
+    return entry->presentation->ScheduleFrameEventX(event, offset_us, flags);
+}
+
+HRESULT xbox_wait_frame_event_x(ID3D12Device* real, UINT event, UINT timeout_ms, UINT flags, std::uint64_t* token) {
+    XboxPresentationEntry* entry = xbox_presentation_for(real, false, nullptr);
+    if (!entry) return S_FALSE;
+    return entry->presentation->WaitFrameEventX(event, timeout_ms, flags, token);
+}
+
+// The proxy's queue slot 32 and device slots 78/79/80 reach the presentation through these hooks (d3d12_xs_device.h),
+// registered once at this translation unit's static init like the placed-resource hooks above.
+const bool g_registered_xbox_presentation = [] {
+    rt::d3d12_xs::set_present_x(&xbox_present_x);
+    rt::d3d12_xs::set_frame_event_callbacks(&xbox_set_frame_interval_x, &xbox_schedule_frame_event_x,
+                                            &xbox_wait_frame_event_x);
+    return true;
+}();
+
+}  // namespace
 
 HRESULT register_samplers(ID3D12Device* device, std::span<const leonida::gfx10::SamplerWords> samplers) {
     if (!device) return E_INVALIDARG;
