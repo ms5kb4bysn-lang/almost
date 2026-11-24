@@ -1383,6 +1383,17 @@ if(TARGET Vulkan::Headers)
     endif()
   endif()
   # CPU-only: the ranking that makes these harnesses prefer a native ICD over Mesa's Dozen (#915). No GPU needed.
+  if(WIN32)
+    # Unified-memory probe: the title's own pages (section views in placeholders, as xmem maps them) imported with
+    # VK_EXT_external_memory_host and sparse-bound into a buffer, coherent both ways. `--sizes` also tries single
+    # imports of 256 MiB to 8 GiB. SKIP without the extension or sparse buffers.
+    add_executable(vk_host_import_probe test/vk_host_import_probe.cpp)
+    target_link_libraries(vk_host_import_probe PRIVATE Vulkan::Headers onecore)
+    target_compile_definitions(vk_host_import_probe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    if(BUILD_TESTING)
+      add_test(NAME vk_host_import COMMAND vk_host_import_probe)
+    endif()
+  endif()
   add_executable(vk_device_pick_test test/vk_device_pick_test.cpp)
   target_link_libraries(vk_device_pick_test PRIVATE Vulkan::Headers)
   if(BUILD_TESTING)
