@@ -25,6 +25,7 @@
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "shader_fixture_path.h"
 #include "vk_test_device.h"
+#include "d3d12_queue_layout.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
@@ -504,6 +505,29 @@ int main() {
             auto desc = texture_desc;
             desc.Format = DXGI_FORMAT_A8_UNORM;
             desc.Flags = flag;
+            if (flag == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
+                // The console renders to A8 (the title's 4K mask target): the layer stores it as R8_UNORM, answers
+                // allocation info and accepts an R8 RTV. The channel mapping is not emulated yet, but the target
+                // must exist. Depth-stencil and UAV use stay invalid.
+                Ref<ID3D12Resource> target;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                 IID_PPV_ARGS(&target.p))));
+                EXPECT(device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes != UINT64_MAX);
+                D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                                     D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+                Ref<ID3D12DescriptorHeap> heap;
+                EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+                // The heap is an Xbox-ABI proxy here: slot 9 returns the handle in RAX, not through a hidden pointer.
+                const D3D12_CPU_DESCRIPTOR_HANDLE handle{static_cast<SIZE_T>(
+                    reinterpret_cast<XboxHeapHandleFn>(slot(heap.p, 9))(heap.p))};
+                std::array<std::uint8_t, 32> before{}, after{};
+                std::memcpy(reinterpret_cast<void*>(handle.ptr), before.data(), before.size());
+                device->CreateRenderTargetView(target.p, nullptr, handle);
+                std::memcpy(after.data(), reinterpret_cast<const void*>(handle.ptr), after.size());
+                EXPECT(after != before);
+                continue;
+            }
             EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
                                                           D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                           __uuidof(ID3D12Resource), nullptr)));
@@ -1615,7 +1639,7 @@ int main() {
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
+        EXPECT(SUCCEEDED(queuelayout::queue_signal(queue.p, fence.p, 1)));
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
 
         // Set 0 now holds what the views and the sampler named. Four runs of the shader: the view's own slot, its
@@ -2331,7 +2355,7 @@ int main() {
         EXPECT(list->Close() == S_OK);
         queue->ExecuteCommandLists(1, lists);
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)));
+        EXPECT(SUCCEEDED(queuelayout::queue_signal(queue.p, fence.p, 2)));
         EXPECT(SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
 #ifdef LEONIDA_TEST_CS_SAMPLE_SPV
         // The view's bytes are still in the slot, but they find nothing any more: the fallback.
@@ -2414,7 +2438,7 @@ int main() {
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
             ++packed_signal;
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, packed_signal)) &&
+            EXPECT(SUCCEEDED(queuelayout::queue_signal(queue.p, fence.p, packed_signal)) &&
                    SUCCEEDED(fence->SetEventOnCompletion(packed_signal, nullptr)));
 
             g::Image packed_image{};
@@ -2500,7 +2524,7 @@ int main() {
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
             ++packed_signal;
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, packed_signal)) &&
+            EXPECT(SUCCEEDED(queuelayout::queue_signal(queue.p, fence.p, packed_signal)) &&
                    SUCCEEDED(fence->SetEventOnCompletion(packed_signal, nullptr)));
 
 #ifdef LEONIDA_TEST_CS_SAMPLE_SPV
@@ -2816,7 +2840,7 @@ int main() {
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
             ++packed_signal;
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, packed_signal)) &&
+            EXPECT(SUCCEEDED(queuelayout::queue_signal(queue.p, fence.p, packed_signal)) &&
                    SUCCEEDED(fence->SetEventOnCompletion(packed_signal, nullptr)));
 #ifdef LEONIDA_TEST_CS_SAMPLE_SPV
             SampleKeys depth_keys[valid_depth_srvs]{};
