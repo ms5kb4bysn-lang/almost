@@ -532,6 +532,20 @@ strict mode, which raises `BcpackProvisionalError` instead of using one.
 (Byte-exact blocks, a clean entropy end state and a DDS with fitted colours are three
 different levels of confirmation; this example shows the first.)
 
+### BCPack in the runtime
+
+The DirectStorage shim (`runtime/shims/xcrdapi.cpp`) unpacks BCPack requests with
+`runtime/shims/bcpack.cpp`, a C++ port of `tools/bcpack.py` (lane model and the six
+rebuilders, tables generated from `tools/bcpack_tables*.py`). The request's BC format number
+(option bits 1–4) is the same `DSTORAGE_BCPACK_MODE`; zlib runs first when both options are set,
+into at most `intermediate_size` bytes. BC2 and the other format numbers are refused with
+`E_NOTIMPL`. Its strict mode refuses exactly what `bcpack.decode` refuses; the shim decodes
+leniently instead, so a block that rests on a provisional or unknown built-in history entry
+(all BC6H/BC7 entries, most BC3/BC4/BC5 ones) is rebuilt from the provisional value, or the
+neutral one, and counted in the exit summary rather than failing the title's load.
+`xcrdapi_test` checks both modes byte-exact against synthetic streams (random lane symbols,
+encoded with the test encoder of `tests/test_bcpack.py`) that `tools/bcpack.py` decodes.
+
 ### The descriptor `mode` is tiling, not codec
 
 The ETPF descriptor's `mode` field (`b >> 23`) is the mip/tile family: mode 0 uses 64 KiB

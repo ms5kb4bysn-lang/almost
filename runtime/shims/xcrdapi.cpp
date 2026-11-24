@@ -16,8 +16,12 @@
 //
 // This first version runs a queue's requests on the thread that submits them, in order. Each request reads its
 // source (a file opened through the GAME:/overlay shim, or memory), inflates zlib data, and writes the destination (an
-// address, or 64 KiB physical pages through rt::xmem). BCPack-compressed requests are refused with E_NOTIMPL and
-// counted: their decoder is the next increment.
+// address, or 64 KiB physical pages through rt::xmem). BCPack requests are unpacked to BC1, BC3, BC4, BC5, BC6H or BC7
+// blocks by bcpack.cpp, after zlib when both options are set (the console's order; the inflated stream is
+// intermediate_size bytes at most). They decode leniently: a block that rests on a built-in history entry nobody has
+// confirmed is rebuilt from the best value known and counted, rather than failing the title's load. BC2 and the other
+// format numbers are refused with E_NOTIMPL and counted.
+#include "bcpack.h"
 #include "inflate.h"
 #include "shims.h"
 #include "xmem.h"
@@ -96,12 +100,13 @@ std::string narrow(const wchar_t* w) {
 }
 
 // Logging: every line is prefixed, and repeats of one kind of failure are capped.
-std::atomic<uint32_t> g_logged_failures{0};
+std::atomic<uint32_t> g_logged_failures{0}, g_logged_approximations{0};
 constexpr uint32_t kFailureLogLimit = 64;
 
 // Counters, printed at exit and by tests.
 struct Stats {
-    std::atomic<uint64_t> requests{0}, failed{0}, zlib{0}, bcpack_refused{0}, pages{0}, memory{0}, bytes_out{0};
+    std::atomic<uint64_t> requests{0}, failed{0}, zlib{0}, bcpack{0}, bcpack_refused{0}, bcpack_approximated{0},
+        pages{0}, memory{0}, bytes_out{0};
 } g_stats;
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -258,16 +263,59 @@ HRESULT into_destination(const Request& r, size_t capacity, Fill fill) {
                : E_INVALIDARG;
 }
 
+// A BCPack request: the source (inflated first with kZlib) unpacks into destination_size bytes of BCn blocks.
+HRESULT execute_bcpack(const Request& r, unsigned bc) {
+    g_stats.bcpack.fetch_add(1);
+    std::vector<uint8_t> buffer;
+    const uint8_t* source = nullptr;
+    HRESULT hr = read_source(r, buffer, source);
+    if (FAILED(hr)) return fail(r, hr, "reading the source");
+    std::vector<uint8_t> inflated;
+    size_t packed_size = r.source_size;
+    if (r.options & kZlib) {
+        g_stats.zlib.fetch_add(1);
+        inflated.resize(r.intermediate_size);
+        const auto s = rt::inflate::zlib(source, r.source_size, inflated.data(), inflated.size(), &packed_size);
+        if (s != rt::inflate::Status::ok) return fail(r, kInvalidData, "zlib before BCPack");
+        source = inflated.data();
+    }
+    rt::bcpack::Info info;
+    rt::bcpack::Status status = rt::bcpack::Status::ok;
+    hr = into_destination(r, r.destination_size, [&](uint8_t* out, size_t capacity, size_t* produced) {
+        status = rt::bcpack::decode(bc, source, packed_size, out, capacity, rt::bcpack::Mode::lenient, &info);
+        if (produced) *produced = capacity;
+        return status == rt::bcpack::Status::ok ? S_OK : kInvalidData;
+    });
+    if (FAILED(hr)) {
+        char why[224];
+        if (status != rt::bcpack::Status::ok)
+            std::snprintf(why, sizeof(why), "BCPack BC%u %s: %s", bc, rt::bcpack::status_name(status), info.detail);
+        else
+            std::snprintf(why, sizeof(why), "BCPack BC%u: writing the destination", bc);
+        return fail(r, hr, why);
+    }
+    if (info.approximated) {
+        g_stats.bcpack_approximated.fetch_add(info.approximated);
+        if (g_logged_approximations.fetch_add(1) < kFailureLogLimit)
+            std::fprintf(stderr, "[rt] xcrdapi: BCPack BC%u approximated %zu of %zu blocks (first: %s) name %s\n", bc,
+                         info.approximated, size_t(r.destination_size) / rt::bcpack::block_bytes(bc), info.detail,
+                         r.name ? r.name : "");
+    }
+    g_stats.bytes_out.fetch_add(r.destination_size);
+    return S_OK;
+}
+
 HRESULT execute(const Request& r) {
     g_stats.requests.fetch_add(1);
     if (r.options & ~kKnownOptions) return fail(r, E_NOTIMPL, "unsupported options");
     if (!r.source || !r.destination) return fail(r, E_INVALIDARG, "no source or destination");
     if (r.options & kMemorySource) g_stats.memory.fetch_add(1);
-    const uint64_t bc = (r.options & kBcpackMask) >> 1;
-    if (bc) {
+    const unsigned bc = static_cast<unsigned>((r.options & kBcpackMask) >> 1);
+    if (bc && !rt::bcpack::block_bytes(bc)) {
         g_stats.bcpack_refused.fetch_add(1);
-        return fail(r, E_NOTIMPL, "BCPack is not implemented yet");
+        return fail(r, E_NOTIMPL, bc == 2 ? "BCPack to BC2 has no decoder" : "unknown BCPack format number");
     }
+    if (bc) return execute_bcpack(r, bc);
     if (!(r.options & kZlib)) {
         if (r.source_size > r.destination_size) return fail(r, E_INVALIDARG, "source larger than destination");
         const HRESULT hr = into_destination(r, r.source_size, [&](uint8_t* out, size_t size, size_t* produced) {
@@ -484,14 +532,16 @@ struct ExitSummary {
     ~ExitSummary() {
         if (!g_stats.requests.load()) return;
         std::fprintf(stderr,
-                     "[rt] xcrdapi: %llu requests (%llu zlib, %llu from memory, %llu into pages), %llu failed (%llu "
-                     "BCPack refused), %llu bytes written\n",
+                     "[rt] xcrdapi: %llu requests (%llu zlib, %llu BCPack, %llu from memory, %llu into pages), %llu "
+                     "failed (%llu BCPack refused), %llu BCPack blocks approximated, %llu bytes written\n",
                      static_cast<unsigned long long>(g_stats.requests.load()),
                      static_cast<unsigned long long>(g_stats.zlib.load()),
+                     static_cast<unsigned long long>(g_stats.bcpack.load()),
                      static_cast<unsigned long long>(g_stats.memory.load()),
                      static_cast<unsigned long long>(g_stats.pages.load()),
                      static_cast<unsigned long long>(g_stats.failed.load()),
                      static_cast<unsigned long long>(g_stats.bcpack_refused.load()),
+                     static_cast<unsigned long long>(g_stats.bcpack_approximated.load()),
                      static_cast<unsigned long long>(g_stats.bytes_out.load()));
     }
 } g_exit_summary;

@@ -111,6 +111,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xmem.cpp
     shims/xcrdapi.cpp
     shims/inflate.cpp
+    shims/bcpack.cpp
     shims/xg_xs.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
@@ -229,12 +230,14 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(winsock_offline_test PRIVATE /OPT:NOREF)
   target_link_libraries(winsock_offline_test PRIVATE ws2_32 psapi)
 
-  # DirectStorage shim (xcrdapi.dll) and its inflate: factory, files, status arrays and queues through their method
-  # tables, raw and zlib requests from files and memory into addresses and xmem physical pages. No game data.
+  # DirectStorage shim (xcrdapi.dll), its inflate and its BCPack decoder: factory, files, status arrays and queues
+  # through their method tables, raw, zlib and BCPack requests from files and memory into addresses and xmem physical
+  # pages, and the decoder against synthetic streams (test/bcpack_test_vectors.h). No game data.
   add_executable(xcrdapi_test
     test/xcrdapi_test.cpp
     shims/xcrdapi.cpp
     shims/inflate.cpp
+    shims/bcpack.cpp
     shims/xmem.cpp
     shims/registry.cpp
   )
