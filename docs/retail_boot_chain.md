@@ -100,3 +100,29 @@ not an `E_NOTIMPL`.
 
 These are one run's first failures, not a list of what is missing. Every stand-in above is local and untested
 beyond "the title goes on to the next call". Nothing has reached a draw or a present yet.
+
+## 5. 2026-11-24: past the old chain
+
+Booting the same executable with the current `feat/dstorage` tree (26,583 translated shaders, an 8 GiB unified
+range, `LEONIDA_D3D12=vulkan`) gets well beyond the stops above. In order, the new facts:
+
+1. **The executable's own shaders.** Ten DXBC containers in its `.data` (1 VS, 9 PS) are not in `shaders.rpf`.
+   `make_game.py`'s BVH step now extracts and translates them into `spirv/bvh/index.json`; before that, six
+   `CreatePipelineState` calls failed at boot with "no translated vs". With them installed the boot has no failed
+   PSO creation.
+2. **AMD-only CPU instructions.** The title's Zen 2 code executes `CLZERO` in a buffer-clear loop and
+   `MONITORX`/`MWAITX` in the fence wait. On an Intel host these raise `STATUS_ILLEGAL_INSTRUCTION`; a vectored
+   handler emulates them (`shims/guest_cpu.h`), and `guest_cpu_test` checks the emulation from hand-built code.
+3. **Console queue layout.** Signal/Wait are at queue slots 16/17, timestamps at 18/19, GetDesc at 20/28, and
+   `PresentX`/`SignalsX`/`ExecuteCommandListsX` at 25/32/34/35. Fence slot 12 returns a completed-value cell for the
+   title's `monitorx` wait.
+4. **Textures at title addresses.** Slot 133 textures are made as committed resources for now and their placed
+   views (slots 70/71) resolve through the address; any other texture view of title memory gets a 1×1 placeholder
+   of the view's format and dimension. This keeps descriptors valid but does not carry the title's streamed data.
+5. **Current stop: the title's own null-object assert in its texture system.** The registers at the fault show
+   `rcx = 0` entering the helper at `game+0xcc2840`; the int3 at `+0xcc2936` is its null check, and skipping it
+   (`LEONIDA_SKIP_INT3`, diagnostic only) continues into the reported access violation at `+0xcc2861`. The object
+   the texture layout path should have produced is still missing — the leading hypothesis is
+   `XGCreateTextureComputer`'s output structures, which the `xg_xs` shim leaves zero when it returns `E_NOTIMPL`.
+
+Nothing has reached a draw or a present yet; the game dies at stop 5 during renderer/texture setup.
