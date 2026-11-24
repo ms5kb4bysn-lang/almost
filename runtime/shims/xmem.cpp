@@ -35,6 +35,7 @@
 
 #include "shims.h"
 #include "startup_trace.h"
+#include "xmem.h"
 
 namespace {
 
@@ -263,6 +264,37 @@ std::vector<uint64_t> g_free_slots;
 uint64_t g_next_slot = 1;
 std::unordered_map<uintptr_t, uint64_t> g_mapped;  // mapped 64 KiB address -> page number
 
+// The memory observer (xmem.h) and what it is replayed: reservations and commits by base. With g_phys_mutex held.
+struct Region {
+    size_t size;
+    uint64_t attributes;
+    bool committed;
+};
+std::map<uintptr_t, Region> g_regions;
+rt::xmem::MemoryObserver g_observer{};
+void* g_observer_context = nullptr;
+
+// LEONIDA_XMEM_LOG=1: one stderr line per reservation, commit and page map/unmap (diagnostic; off by default).
+bool memory_log() {
+    static const bool on = [] {
+        char value[8] = {};
+        return GetEnvironmentVariableA("LEONIDA_XMEM_LOG", value, sizeof(value)) > 0 && value[0] != '0';
+    }();
+    return on;
+}
+
+// With g_phys_mutex held.
+void note_region(uintptr_t base, size_t size, uint64_t attributes, bool committed, const void* caller) {
+    g_regions[base] = Region{size, attributes, committed};
+    if (memory_log())
+        std::fprintf(stderr, "[rt] xmem: %s 0x%llx + 0x%llx (attributes 0x%llx) from %s\n",
+                     committed ? "commit" : "reserve", static_cast<unsigned long long>(base),
+                     static_cast<unsigned long long>(size), static_cast<unsigned long long>(attributes),
+                     rt::shims::module_offset(reinterpret_cast<uint64_t>(caller)).c_str());
+    if (committed && g_observer.committed) g_observer.committed(g_observer_context, base, size, attributes);
+    if (!committed && g_observer.reserved) g_observer.reserved(g_observer_context, base, size, attributes);
+}
+
 // With g_phys_mutex held. A window replaces every window it overlaps: the title released those regions (with
 // kernel32!VirtualFree, which the shim does not see) before the host could hand the addresses out again.
 void record_window(void* base, SIZE_T size, DWORD protect) {
@@ -394,22 +426,27 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         return nullptr;
     }
 
+    const void* const caller = _ReturnAddress();
     if (replace) {
         const std::lock_guard lock(g_phys_mutex);
         if (!isolate_placeholder(address, size)) return nullptr;
         if (window) {
             // A reserve-only replacement stays a placeholder: the physical pages are mapped into it.
             record_window(address, size, host_prot);
+            note_region(reinterpret_cast<uintptr_t>(address), size, attributes, false, caller);
             return address;
         }
-        return placeholder_api().virtual_alloc2(GetCurrentProcess(), address, size, host_type | MEM_RESERVE, host_prot,
-                                                nullptr, 0);
+        void* const result = placeholder_api().virtual_alloc2(GetCurrentProcess(), address, size,
+                                                              host_type | MEM_RESERVE, host_prot, nullptr, 0);
+        if (result && commit) note_region(reinterpret_cast<uintptr_t>(result), size, attributes, true, caller);
+        return result;
     }
     if (new_placeholder || window) {
         void* const result = reserve_placeholder(address, size, base_granularity);
-        if (result && window) {
+        if (result) {
             const std::lock_guard lock(g_phys_mutex);
-            record_window(result, size, host_prot);
+            if (window) record_window(result, size, host_prot);
+            note_region(reinterpret_cast<uintptr_t>(result), size, attributes, false, caller);
         }
         return result;
     }
@@ -419,10 +456,20 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         MEM_EXTENDED_PARAMETER parameter{};
         parameter.Type = MemExtendedParameterAddressRequirements;
         parameter.Pointer = &requirements;
-        return placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size, host_type | MEM_RESERVE, host_prot,
-                                                &parameter, 1);
+        void* const result = placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size,
+                                                              host_type | MEM_RESERVE, host_prot, &parameter, 1);
+        if (result && commit) {
+            const std::lock_guard lock(g_phys_mutex);
+            note_region(reinterpret_cast<uintptr_t>(result), size, attributes, true, caller);
+        }
+        return result;
     }
-    return VirtualAlloc(address, size, host_type, host_prot);
+    void* const result = VirtualAlloc(address, size, host_type, host_prot);
+    if (result && commit) {
+        const std::lock_guard lock(g_phys_mutex);
+        note_region(reinterpret_cast<uintptr_t>(result), size, attributes, true, caller);
+    }
+    return result;
 }
 
 // With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
@@ -434,6 +481,8 @@ bool unmap_page(uintptr_t address) {
         return false;
     }
     g_mapped.erase(it);
+    if (memory_log()) std::fprintf(stderr, "[rt] xmem: unmap 0x%llx\n", static_cast<unsigned long long>(address));
+    if (g_observer.page_unmapped) g_observer.page_unmapped(g_observer_context, address);
     return true;
 }
 
@@ -454,6 +503,11 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
                                                    protect, nullptr, 0);
     if (!view) return false;
     g_mapped[address] = page;
+    if (memory_log())
+        std::fprintf(stderr, "[rt] xmem: map page 0x%llx at 0x%llx\n", static_cast<unsigned long long>(page),
+                     static_cast<unsigned long long>(address));
+    if (g_observer.page_mapped)
+        g_observer.page_mapped(g_observer_context, address, it->second.section->handle, it->second.offset);
     return true;
 }
 
@@ -716,6 +770,23 @@ bool write_physical(const uint64_t* pages, size_t page_count, size_t offset, con
         size -= n;
     }
     return true;
+}
+
+void set_memory_observer(void* context, const MemoryObserver* observer) {
+    const std::lock_guard lock(g_phys_mutex);
+    g_observer = observer ? *observer : MemoryObserver{};
+    g_observer_context = observer ? context : nullptr;
+    if (!observer) return;
+    for (const auto& [base, region] : g_regions) {
+        if (region.committed && g_observer.committed)
+            g_observer.committed(context, base, region.size, region.attributes);
+        if (!region.committed && g_observer.reserved) g_observer.reserved(context, base, region.size, region.attributes);
+    }
+    if (g_observer.page_mapped)
+        for (const auto& [address, page] : g_mapped) {
+            const auto it = g_pages.find(page);
+            if (it != g_pages.end()) g_observer.page_mapped(context, address, it->second.section->handle, it->second.offset);
+        }
 }
 
 }  // namespace rt::xmem

@@ -21,6 +21,9 @@
 
 #include "shims.h"
 #include "startup_trace.h"
+#include "xmem.h"
+
+#include <vector>
 
 namespace {
 
@@ -648,6 +651,81 @@ void print_result() {
     }
 }
 
+// rt::xmem::set_memory_observer: reservations, commits and page maps/unmaps are reported as they happen, with the
+// section and offset that name the page (what a GPU layer imports), and the live state is replayed on attach.
+struct ObservedEvents {
+    std::vector<std::pair<uintptr_t, size_t>> reserved, committed;
+    std::vector<std::pair<uintptr_t, std::pair<void*, uint64_t>>> mapped;
+    std::vector<uintptr_t> unmapped;
+};
+
+void test_memory_observer(const PhysicalApi& api) {
+    ObservedEvents events;
+    rt::xmem::MemoryObserver observer{};
+    observer.reserved = [](void* c, uintptr_t base, size_t size, uint64_t) {
+        static_cast<ObservedEvents*>(c)->reserved.push_back({base, size});
+    };
+    observer.committed = [](void* c, uintptr_t base, size_t size, uint64_t) {
+        static_cast<ObservedEvents*>(c)->committed.push_back({base, size});
+    };
+    observer.page_mapped = [](void* c, uintptr_t address, void* section, uint64_t offset) {
+        static_cast<ObservedEvents*>(c)->mapped.push_back({address, {section, offset}});
+    };
+    observer.page_unmapped = [](void* c, uintptr_t address) { static_cast<ObservedEvents*>(c)->unmapped.push_back(address); };
+    rt::xmem::set_memory_observer(&events, &observer);
+    events = ObservedEvents{};  // the replay of earlier tests' state is checked below, not here
+
+    constexpr uint64_t kPages = 2;
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x27, PAGE_READWRITE));
+    check(window != nullptr && events.reserved.size() == 1 &&
+              events.reserved[0] == std::make_pair(reinterpret_cast<uintptr_t>(window), static_cast<size_t>(kPages * kPage64k)),
+          "observer: a reserve-only 64 KiB-page window is reported with its base and size");
+    void* const committed = api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT, 0x183, PAGE_READWRITE);
+    check(committed != nullptr && events.committed.size() == 1 &&
+              events.committed[0].first == reinterpret_cast<uintptr_t>(committed),
+          "observer: committed memory is reported");
+    if (!window) return;
+
+    uint64_t pages[kPages]{};
+    uint64_t count = kPages;
+    api.allocate(0x280, &count, pages);
+    check(api.map(window, kPages, pages) == window && events.mapped.size() == kPages &&
+              events.mapped[0].first == reinterpret_cast<uintptr_t>(window) &&
+              events.mapped[1].first == reinterpret_cast<uintptr_t>(window) + kPage64k,
+          "observer: each mapped page is reported at its address");
+    // The reported section and offset are the page: a view of them shows what the title wrote through its mapping.
+    window[kPage64k + 123] = 0x5c;
+    bool same = !events.mapped.empty() && events.mapped.size() == kPages && events.mapped[1].second.first != nullptr;
+    if (same) {
+        const uint64_t offset = events.mapped[1].second.second;
+        void* view = MapViewOfFile(events.mapped[1].second.first, FILE_MAP_READ, static_cast<DWORD>(offset >> 32),
+                                   static_cast<DWORD>(offset), kPage64k);
+        same = view && static_cast<uint8_t*>(view)[123] == 0x5c;
+        if (view) UnmapViewOfFile(view);
+    }
+    check(same, "observer: the reported section and offset name the mapped page");
+
+    ObservedEvents replay;
+    rt::xmem::set_memory_observer(&replay, &observer);
+    bool window_replayed = false;
+    for (const auto& r : replay.reserved) window_replayed |= r.first == reinterpret_cast<uintptr_t>(window);
+    size_t pages_replayed = 0;
+    for (const auto& m : replay.mapped)
+        pages_replayed += m.first >= reinterpret_cast<uintptr_t>(window) &&
+                          m.first < reinterpret_cast<uintptr_t>(window) + kPages * kPage64k;
+    check(window_replayed && pages_replayed == kPages, "observer: attaching replays live reservations and mapped pages");
+
+    check(api.map(window, kPages, nullptr) == window && replay.unmapped.size() == kPages,
+          "observer: unmapping reports each page");
+    rt::xmem::set_memory_observer(nullptr, nullptr);
+    const size_t before = replay.unmapped.size();
+    api.map(window, kPages, pages);
+    api.map(window, kPages, nullptr);
+    check(replay.unmapped.size() == before, "observer: a removed observer hears nothing");
+    api.free_pages(kPages, pages);
+}
+
 }  // namespace
 
 int main() {
@@ -718,6 +796,7 @@ int main() {
     if (tools_mem) check(tools_mem() == FALSE, "XMemIsToolsMemAvailable returns FALSE (no devkit tools memory)");
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);
+        test_memory_observer(physical);
         test_placeholders(physical);
     }
 
