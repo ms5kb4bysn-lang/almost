@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -502,9 +503,18 @@ HRESULT STDMETHODCALLTYPE factory_create_queue(Header*, const QueueDesc* desc, c
         std::fprintf(stderr, "[rt] xcrdapi: CreateQueue with interface %s\n", guid_text(iid).c_str());
     auto* q = new Queue{{kQueueVtbl, {1}, &kQueueIid, "queue", &destroy_queue}, {}, {}, desc->capacity,
                         desc->priority, desc->name ? desc->name : ""};
-    std::fprintf(stderr, "[rt] xcrdapi: queue \"%s\": source type %llu, capacity %u, priority %d, unknown %llu\n",
-                 q->name.c_str(), static_cast<unsigned long long>(desc->source_type), desc->capacity, desc->priority,
-                 static_cast<unsigned long long>(desc->unknown));
+    // The title creates a queue per streaming request; the first of each name is enough to identify the layout.
+    static std::mutex log_mutex;
+    static std::set<std::string> logged_names;
+    bool first = false;
+    {
+        const std::lock_guard lock(log_mutex);
+        first = logged_names.insert(q->name).second;
+    }
+    if (first)
+        std::fprintf(stderr, "[rt] xcrdapi: queue \"%s\": source type %llu, capacity %u, priority %d, unknown %llu\n",
+                     q->name.c_str(), static_cast<unsigned long long>(desc->source_type), desc->capacity,
+                     desc->priority, static_cast<unsigned long long>(desc->unknown));
     *out = q;
     return S_OK;
 }

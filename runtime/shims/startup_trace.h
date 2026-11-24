@@ -185,7 +185,26 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
-            if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
+            if (info.ContextRecord) {
+                // The general registers at the fault: the stack alone does not say which pointer was null.
+                const CONTEXT& c = *info.ContextRecord;
+                char registers[320];
+                std::snprintf(registers, sizeof(registers),
+                              ",\"registers\":{\"rax\":\"0x%llx\",\"rbx\":\"0x%llx\",\"rcx\":\"0x%llx\","
+                              "\"rdx\":\"0x%llx\",\"rsi\":\"0x%llx\",\"rdi\":\"0x%llx\",\"r8\":\"0x%llx\","
+                              "\"r9\":\"0x%llx\",\"r10\":\"0x%llx\",\"r11\":\"0x%llx\",\"r12\":\"0x%llx\","
+                              "\"r13\":\"0x%llx\",\"r14\":\"0x%llx\",\"r15\":\"0x%llx\",\"rsp\":\"0x%llx\"}",
+                              static_cast<unsigned long long>(c.Rax), static_cast<unsigned long long>(c.Rbx),
+                              static_cast<unsigned long long>(c.Rcx), static_cast<unsigned long long>(c.Rdx),
+                              static_cast<unsigned long long>(c.Rsi), static_cast<unsigned long long>(c.Rdi),
+                              static_cast<unsigned long long>(c.R8), static_cast<unsigned long long>(c.R9),
+                              static_cast<unsigned long long>(c.R10), static_cast<unsigned long long>(c.R11),
+                              static_cast<unsigned long long>(c.R12), static_cast<unsigned long long>(c.R13),
+                              static_cast<unsigned long long>(c.R14), static_cast<unsigned long long>(c.R15),
+                              static_cast<unsigned long long>(c.Rsp));
+                f += registers;
+                f += ",\"stack\":" + stack_from(c);
+            }
             event("exception", f);
         }
     } catch (...) {

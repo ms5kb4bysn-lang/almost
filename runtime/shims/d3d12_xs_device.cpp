@@ -1962,11 +1962,15 @@ void proxy_create_placed_view(DeviceProxy* self, bool unordered, std::uint64_t r
         // so the descriptor is real rather than null and the title's bookkeeping has an object. The image has none
         // of the streamed data (sampling is wrong); it only keeps the frame's descriptors valid.
         if (resource_desc && resource_desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
-            DXGI_FORMAT format = static_cast<DXGI_FORMAT>(words[0]);
-            if (format == DXGI_FORMAT_UNKNOWN) format = resource_desc->Format;
+            // The view description's own fields shape the placeholder: Format (word 0), ViewDimension (word 1) and
+            // the union after it (MipLevels, then ArraySize / NumCubes). A 1x1 resource of the matching dimension and
+            // array size keeps CreateShaderResourceView/CreateUnorderedAccessView valid; a mismatched one would fail
+            // and leave the null view the game crashes on.
+            const DXGI_FORMAT format = static_cast<DXGI_FORMAT>(words[0]);
+            const auto view_dimension = static_cast<D3D12_SRV_DIMENSION>(words[1]);
             if (format != DXGI_FORMAT_UNKNOWN) {
                 D3D12_RESOURCE_DESC placeholder{};
-                placeholder.Dimension = resource_desc->Dimension;
+                placeholder.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
                 placeholder.Width = 1;
                 placeholder.Height = 1;
                 placeholder.DepthOrArraySize = 1;
@@ -1974,13 +1978,29 @@ void proxy_create_placed_view(DeviceProxy* self, bool unordered, std::uint64_t r
                 placeholder.Format = format;
                 placeholder.SampleDesc.Count = 1;
                 placeholder.Flags = unordered ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+                switch (view_dimension) {
+                case D3D12_SRV_DIMENSION_TEXTURE3D:
+                    placeholder.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+                    break;
+                case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+                    placeholder.DepthOrArraySize = static_cast<UINT16>(std::max(1u, words[4]));
+                    break;
+                case D3D12_SRV_DIMENSION_TEXTURECUBE:
+                    placeholder.DepthOrArraySize = 6;
+                    break;
+                case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+                    placeholder.DepthOrArraySize = static_cast<UINT16>(6 * std::max(1u, words[5]));
+                    break;
+                default: break;
+                }
                 D3D12_HEAP_PROPERTIES heap{};
                 heap.Type = D3D12_HEAP_TYPE_DEFAULT;
                 void* made = nullptr;
-                if (SUCCEEDED(proxy_create_resource(self, &heap, D3D12_HEAP_FLAG_NONE, &placeholder,
-                                                    D3D12_RESOURCE_STATE_COMMON, nullptr, &__uuidof(ID3D12Resource),
-                                                    &made)) &&
-                    made) {
+                // The placeholder is a plain PC description; the console translator must not see it.
+                const HRESULT hr = self->real->CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &placeholder, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                    __uuidof(ID3D12Resource), &made);
+                if (SUCCEEDED(hr) && made) {
                     auto* texture = static_cast<ID3D12Resource*>(made);
                     register_at_address(address, texture);
                     const D3D12_CPU_DESCRIPTOR_HANDLE dst{static_cast<SIZE_T>(handle)};
@@ -1999,6 +2019,14 @@ void proxy_create_placed_view(DeviceProxy* self, bool unordered, std::uint64_t r
                                      static_cast<unsigned long long>(address), unordered ? "UAV" : "SRV");
                     return;
                 }
+                static std::atomic<int> failed{0};
+                if (failed.fetch_add(1) < 8)
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: 1x1 placeholder at 0x%llx refused: 0x%08lx (dimension %u, view "
+                                 "dimension %u, format %u)\n",
+                                 static_cast<unsigned long long>(address), static_cast<unsigned long>(hr),
+                                 static_cast<unsigned>(placeholder.Dimension), static_cast<unsigned>(view_dimension),
+                                 static_cast<unsigned>(format));
             }
         }
     }
