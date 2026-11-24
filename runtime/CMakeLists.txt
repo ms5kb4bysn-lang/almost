@@ -1709,6 +1709,20 @@ if(TARGET Vulkan::Headers)
     endif()
     set_tests_properties(d3d12_vulkan_device PROPERTIES SKIP_RETURN_CODE 77)
 
+    # The unified GPU address arena end to end (LEONIDA_UNIFIED_GB, VK_EXT_external_memory_host): xmem.cpp and
+    # registry.cpp are compiled in, so the xmem table fills rt::unified::api and the title-style allocations, physical
+    # pages and placed descriptor heaps go through the shim. Skips without the extension or a sparse buffer that large
+    # (Intel's maxBufferSize is 4 GiB: the _4gib run covers it).
+    add_executable(unified_arena_test test/unified_arena_test.cpp shims/xmem.cpp shims/registry.cpp)
+    target_link_libraries(unified_arena_test PRIVATE gta6rt_d3d12_com psapi)
+    target_include_directories(unified_arena_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+    target_compile_definitions(unified_arena_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(unified_arena_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(unified_arena_test PRIVATE /OPT:NOREF)
+    add_test(NAME unified_arena COMMAND unified_arena_test)
+    add_test(NAME unified_arena_4gib COMMAND unified_arena_test --gib 4)
+    set_tests_properties(unified_arena unified_arena_4gib PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
     add_executable(d3d12_texture1d_test test/d3d12_texture1d_test.cpp)
     target_link_libraries(d3d12_texture1d_test PRIVATE gta6rt_d3d12_com dxguid)
     target_compile_definitions(d3d12_texture1d_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
