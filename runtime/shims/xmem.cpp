@@ -345,6 +345,31 @@ PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
                                             PAGE_NOACCESS, parameter_count ? &parameter : nullptr, parameter_count);
 }
 
+// The unified range (LEONIDA_UNIFIED_GB, rt::xmem::configure_unified): the free parts of [64 KiB, N GiB) reserved
+// as placeholders before any title code runs, from which every XMemVirtualAlloc that lets the system choose the
+// address is carved. The title's GPU-visible memory then lies low, where one GPU buffer can cover it at offset ==
+// address: the translated shaders address memory as heap_base + console VA, most of them truncate descriptor-table
+// pointers to 32 bits, and the BVH builder takes destinations below 2^40 (docs/d3d12_vulkan.md section 3.3), none of
+// which the system's own placement (around 0x26a00000000 on the measured boot) satisfies. With g_phys_mutex held.
+std::map<uintptr_t, size_t> g_unified_free;  // free placeholder pieces, each inside one placeholder: base -> size
+uintptr_t g_unified_end = 0;                 // 0: no unified range
+
+// Takes an `alignment`-aligned block of `size` bytes (64 KiB multiples) from the unified range, left as one placeholder
+// of exactly that extent. 0 when nothing fits.
+uintptr_t carve_unified(size_t size, size_t alignment) {
+    for (auto it = g_unified_free.begin(); it != g_unified_free.end(); ++it) {
+        const uintptr_t base = it->first, end = base + it->second;
+        const uintptr_t at = (base + alignment - 1) & ~(static_cast<uintptr_t>(alignment) - 1);
+        if (at < base || at + size < at || at + size > end) continue;
+        if (!isolate_placeholder(reinterpret_cast<void*>(at), size)) continue;
+        g_unified_free.erase(it);
+        if (at > base) g_unified_free[base] = at - base;
+        if (at + size < end) g_unified_free[at + size] = end - (at + size);
+        return at;
+    }
+    return 0;
+}
+
 // PVOID XMemVirtualAlloc(address, size, allocationType, attributes, protect). All 23 calls of the measured title pass a
 // nonzero attribute word; its bits are not decoded and nothing on the host depends on them, so it is accepted and only
 // recorded (xmem_attributes). Its types cover committed 2 MiB and 64 KiB pages, reserve-only 64 KiB windows for physical pages, one
@@ -427,6 +452,31 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     }
 
     const void* const caller = _ReturnAddress();
+    if (address == nullptr && !replace) {
+        // The unified range, when there is one: the same allocation, at an address carved from it.
+        const std::lock_guard lock(g_phys_mutex);
+        if (g_unified_end) {
+            const size_t bytes = (size + kXmemPageSize64k - 1) & ~(static_cast<size_t>(kXmemPageSize64k) - 1);
+            const size_t alignment = base_granularity > kXmemPageSize64k ? base_granularity : kXmemPageSize64k;
+            if (const uintptr_t at = bytes >= size ? carve_unified(bytes, alignment) : 0) {
+                void* const block = reinterpret_cast<void*>(at);
+                if (new_placeholder || window) {
+                    if (window) record_window(block, bytes, host_prot);
+                    note_region(at, bytes, attributes, false, caller);
+                    return block;
+                }
+                void* const result = placeholder_api().virtual_alloc2(
+                    GetCurrentProcess(), block, bytes, (host_type & ~MEM_RESERVE_PLACEHOLDER) | MEM_RESERVE |
+                    MEM_REPLACE_PLACEHOLDER, host_prot, nullptr, 0);
+                if (result) {
+                    note_region(at, bytes, attributes, commit, caller);
+                    return result;
+                }
+                // Refused (a protection the host rejects, say): the block stays a placeholder, and the allocation is
+                // made where the system puts it, as without a unified range.
+            }
+        }
+    }
     if (replace) {
         const std::lock_guard lock(g_phys_mutex);
         if (!isolate_placeholder(address, size)) return nullptr;
@@ -770,6 +820,40 @@ bool write_physical(const uint64_t* pages, size_t page_count, size_t offset, con
         size -= n;
     }
     return true;
+}
+
+uint64_t configure_unified(uint64_t bytes) {
+    const std::lock_guard lock(g_phys_mutex);
+    if (g_unified_end || !placeholder_api().available() || bytes <= kXmemPageSize64k) return 0;
+    uint64_t reserved = 0;
+    unsigned pieces = 0;
+    uintptr_t at = kXmemPageSize64k;  // VA 0's 64 KiB stay unused, as the GPU address arena keeps them
+    MEMORY_BASIC_INFORMATION info{};
+    while (at < bytes && VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info))) {
+        const uintptr_t region_end = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (info.State == MEM_FREE) {
+            const uintptr_t start = (at + kXmemPageSize64k - 1) & ~(static_cast<uintptr_t>(kXmemPageSize64k) - 1);
+            const uintptr_t end = (region_end < bytes ? region_end : static_cast<uintptr_t>(bytes)) &
+                                  ~(static_cast<uintptr_t>(kXmemPageSize64k) - 1);
+            if (end > start && reserve_placeholder(reinterpret_cast<void*>(start), end - start, 0)) {
+                g_unified_free[start] = end - start;
+                reserved += end - start;
+                ++pieces;
+            }
+        }
+        if (region_end <= at) break;
+        at = region_end;
+    }
+    g_unified_end = static_cast<uintptr_t>(bytes);
+    std::fprintf(stderr, "[rt] xmem: unified range [0x10000, 0x%llx): %.1f GiB reserved in %u piece(s)\n",
+                 static_cast<unsigned long long>(bytes), static_cast<double>(reserved) / (1ull << 30), pieces);
+    return reserved;
+}
+
+bool unified_range(uint64_t* end) {
+    const std::lock_guard lock(g_phys_mutex);
+    if (end) *end = g_unified_end;
+    return g_unified_end != 0;
 }
 
 void set_memory_observer(void* context, const MemoryObserver* observer) {

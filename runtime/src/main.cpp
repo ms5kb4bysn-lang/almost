@@ -36,6 +36,7 @@
 #include "../shims/process_shim.h"
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
+#include "../shims/xmem.h"
 
 namespace {
 
@@ -180,6 +181,17 @@ int wmain(int argc, wchar_t** argv) {
                              r.error);
         }
         if (run) rt::process::set_command_line(image.filename().wstring(), game_args);
+        // LEONIDA_UNIFIED_GB=n (experimental, off by default): the title's XMemVirtualAlloc memory is placed in
+        // [64 KiB, n GiB), reserved here, after the images are mapped and before any of their code runs (TLS callbacks
+        // and DllMain already allocate). See rt::xmem::configure_unified.
+        if (init || run) {
+            wchar_t value[16] = {};
+            if (GetEnvironmentVariableW(L"LEONIDA_UNIFIED_GB", value, 16) > 0) {
+                const unsigned long long gib = std::wcstoull(value, nullptr, 10);
+                if (gib >= 1 && gib <= 1024) rt::xmem::configure_unified(gib << 30);
+                else std::fprintf(stderr, "[rt] LEONIDA_UNIFIED_GB=%ls ignored (1 to 1024)\n", value);
+            }
+        }
         std::exception_ptr init_failure;
         if (init || run) {
             try {

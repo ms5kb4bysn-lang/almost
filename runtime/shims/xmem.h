@@ -27,6 +27,16 @@ struct MemoryObserver {
     void (*page_unmapped)(void* context, uintptr_t address);
 };
 
+// The unified range: reserves the free parts of [64 KiB, `bytes`) as placeholders, and from then on every
+// XMemVirtualAlloc that lets the system choose its address is carved from them instead, so the title's GPU-visible
+// memory lies where one GPU buffer can cover it at offset == address (the translated shaders' heap_base + VA, the
+// 32-bit descriptor-table pointers and the BVH builder's 2^40 limit; docs/d3d12_vulkan.md section 3.3). Call once,
+// after the title's images are mapped (their ranges stay theirs) and before any of its code runs. Returns the bytes
+// reserved (0: none; already configured, or no placeholder API). main.cpp calls it for LEONIDA_UNIFIED_GB.
+uint64_t configure_unified(uint64_t bytes);
+// Whether a unified range exists, and its end (it starts at 64 KiB).
+bool unified_range(uint64_t* end);
+
 // Installs `observer` (null: removes it), then replays what is live: every reservation and every mapped page, so an
 // observer that attaches after the title began still sees all of it. One observer at a time.
 void set_memory_observer(void* context, const MemoryObserver* observer);

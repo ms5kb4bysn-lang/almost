@@ -726,6 +726,50 @@ void test_memory_observer(const PhysicalApi& api) {
     api.free_pages(kPages, pages);
 }
 
+// rt::xmem::configure_unified: allocations that let the system choose land inside [64 KiB, end), each kind as before
+// (a placeholder, a window physical pages map into, committed memory), and a given address is still honoured.
+void test_unified_range(const PhysicalApi& api) {
+    constexpr uint64_t kEnd = 64ull << 30;
+    const uint64_t reserved = rt::xmem::configure_unified(kEnd);
+    uint64_t end = 0;
+    check(reserved > (1ull << 30) && rt::xmem::unified_range(&end) && end == kEnd,
+          "unified: the free parts of [64 KiB, 64 GiB) are reserved");
+    check(rt::xmem::configure_unified(kEnd) == 0, "unified: a second configuration is refused");
+    const auto inside = [&](const void* p, size_t size) {
+        const auto a = reinterpret_cast<uintptr_t>(p);
+        return p && a >= 0x10000 && a + size <= kEnd;
+    };
+    void* committed = api.virtual_alloc(nullptr, 3 * kPage64k + 100, MEM_RESERVE | MEM_COMMIT, 0x183, PAGE_READWRITE);
+    check(inside(committed, 4 * kPage64k), "unified: committed memory lands in the range");
+    if (committed) {
+        static_cast<uint8_t*>(committed)[4 * kPage64k - 1] = 1;  // rounded up to 64 KiB, all of it committed
+        MEMORY_BASIC_INFORMATION info{};
+        VirtualQuery(committed, &info, sizeof(info));
+        check(info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE, "unified: ... committed read-write");
+    }
+    void* large = api.virtual_alloc(nullptr, kPage2m, MEM_RESERVE | MEM_COMMIT | kXmemLargePages, 0x183,
+                                    PAGE_READWRITE);
+    check(inside(large, kPage2m) && reinterpret_cast<uintptr_t>(large) % kPage2m == 0,
+          "unified: a 2 MiB-page allocation lands in the range, 2 MiB-aligned");
+    auto* window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 2 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x27, PAGE_READWRITE));
+    check(inside(window, 2 * kPage64k), "unified: a reserve-only 64 KiB-page window lands in the range");
+    uint64_t pages[2]{};
+    uint64_t count = 2;
+    if (window && api.allocate(0x280, &count, pages)) {
+        check(api.map(window, 2, pages) == window, "unified: physical pages map into that window");
+        window[kPage64k + 7] = 9;
+        check(window[kPage64k + 7] == 9, "unified: ... and are usable");
+        api.map(window, 2, nullptr);
+        api.free_pages(2, pages);
+    }
+    void* placeholder = api.virtual_alloc(nullptr, 4 * kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0x7, PAGE_NOACCESS);
+    check(inside(placeholder, 4 * kPage64k), "unified: a placeholder reservation lands in the range");
+    void* elsewhere = VirtualAlloc(nullptr, kPage64k, MEM_RESERVE, PAGE_NOACCESS);
+    check(elsewhere && !inside(elsewhere, kPage64k), "unified: host allocations do not take the range");
+    if (elsewhere) VirtualFree(elsewhere, 0, MEM_RELEASE);
+}
+
 }  // namespace
 
 int main() {
@@ -797,6 +841,7 @@ int main() {
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);
         test_memory_observer(physical);
+        test_unified_range(physical);  // last: the range is process-wide and changes where allocations land
         test_placeholders(physical);
     }
 
