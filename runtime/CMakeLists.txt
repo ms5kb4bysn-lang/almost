@@ -107,6 +107,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/registry.cpp
     shims/file_system.cpp
     shims/winhttp_offline.cpp
+    shims/winsock_offline.cpp
     shims/xmem.cpp
     shims/xcrdapi.cpp
     shims/inflate.cpp
@@ -214,6 +215,19 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(xmem_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
+
+  # Winsock for the title, loopback only: refusals of public destinations and names, bind to loopback, the imported
+  # ordinals checked against the host's ws2_32.dll. Nothing leaves the machine.
+  add_executable(winsock_offline_test
+    test/winsock_offline_test.cpp
+    shims/winsock_offline.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(winsock_offline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(winsock_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(winsock_offline_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(winsock_offline_test PRIVATE /OPT:NOREF)
+  target_link_libraries(winsock_offline_test PRIVATE ws2_32 psapi)
 
   # DirectStorage shim (xcrdapi.dll) and its inflate: factory, files, status arrays and queues through their method
   # tables, raw and zlib requests from files and memory into addresses and xmem physical pages. No game data.
@@ -1027,6 +1041,7 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
     add_test(NAME xcrdapi COMMAND xcrdapi_test)
+    add_test(NAME winsock_offline COMMAND winsock_offline_test)
   endif()
   if(WIN32 AND TARGET xg_xs_test)
     add_test(NAME xg_xs COMMAND xg_xs_test)
