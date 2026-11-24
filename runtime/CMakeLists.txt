@@ -108,6 +108,8 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/file_system.cpp
     shims/winhttp_offline.cpp
     shims/xmem.cpp
+    shims/xcrdapi.cpp
+    shims/inflate.cpp
     shims/xg_xs.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
@@ -212,6 +214,21 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(xmem_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
+
+  # DirectStorage shim (xcrdapi.dll) and its inflate: factory, files, status arrays and queues through their method
+  # tables, raw and zlib requests from files and memory into addresses and xmem physical pages. No game data.
+  add_executable(xcrdapi_test
+    test/xcrdapi_test.cpp
+    shims/xcrdapi.cpp
+    shims/inflate.cpp
+    shims/xmem.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(xcrdapi_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xcrdapi_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xcrdapi_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xcrdapi_test PRIVATE /OPT:NOREF)
+  target_link_libraries(xcrdapi_test PRIVATE psapi)
 
   # xg_xs shim: the two exports and the texture computer's slots against the measured call shapes.
   add_executable(xg_xs_test
@@ -1009,6 +1026,7 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
+    add_test(NAME xcrdapi COMMAND xcrdapi_test)
   endif()
   if(WIN32 AND TARGET xg_xs_test)
     add_test(NAME xg_xs COMMAND xg_xs_test)

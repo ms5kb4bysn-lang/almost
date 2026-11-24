@@ -39,6 +39,8 @@
 #include <iterator>
 #include <new>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <utility>
 
 namespace rt::d3d12_xs {
@@ -1140,6 +1142,27 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     // one to give, although the SDK annotates the parameter as required.
 #pragma warning(suppress : 6387)
     if (!out) return self->real->CreateCommandQueue(desc, *riid, nullptr);
+    // The console has queue flags past the PC's DISABLE_GPU_TIMEOUT (bit 0): game_scarlett_master.exe 1.0.2.1 makes
+    // its compute queues through slot 48 with Flags 1, 2 and 3 (descriptions at exe+0x615c130, +0x615c1b0 duplicated,
+    // +0x615c140; the call at exe+0x2478853 breaks on a failure). Their meaning is not measured; the PC queue gets the
+    // bits it knows and the rest are logged once per value.
+    D3D12_COMMAND_QUEUE_DESC pc_desc{};
+    constexpr UINT kPcFlags = D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
+    if (desc) {
+        if (const UINT extra = static_cast<UINT>(desc->Flags) & ~kPcFlags) {
+            {
+                static std::mutex logged_mutex;
+                static std::set<UINT> logged;
+                const std::lock_guard lock(logged_mutex);
+                if (logged.insert(extra).second)
+                    std::fprintf(stderr, "[rt] d3d12_xs: command queue (type %d) with console flags 0x%x: not on the "
+                                 "PC, dropped\n", static_cast<int>(desc->Type), extra);
+            }
+            pc_desc = *desc;
+            pc_desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(static_cast<UINT>(desc->Flags) & kPcFlags);
+            desc = &pc_desc;  // only then a copy: a PC description reaches the device as the caller passed it
+        }
+    }
     void* created = nullptr;
     const HRESULT hr = self->real->CreateCommandQueue(desc, __uuidof(ID3D12CommandQueue), &created);
     if (FAILED(hr)) return hr;
@@ -1480,6 +1503,41 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                                                *riid, out);
 }
 
+// The struct-returning device methods: 25 GetResourceAllocationInfo, 26 GetCustomHeapProperties, 43 GetAdapterLuid.
+// The title passes the hidden return pointer in RCX and the device in RDX, then the method's own arguments
+// (game_scarlett_master.exe 1.0.2.1: slot 26 at exe+0x247870d, +0x2478731 and +0x2478758 with RCX = a stack buffer and
+// RDX the device; slot 25 the same at exe+0x34413f and +0x344182). The PC runtime's member functions take `this`
+// first, so forwarding those words unchanged handed the PC device a stack buffer as `this` (an access violation at
+// 0xd0, the buffer's zero "vtable" plus slot 26). Which word is the proxy is checked, so a caller using the PC order
+// also works; the PC method is called through its interface and the result stored where the caller asked, and RAX
+// returns that pointer, as the x64 ABI does for a hidden return pointer.
+template <unsigned Slot>
+std::uint64_t proxy_struct_return(std::uint64_t rcx, std::uint64_t rdx, std::uint64_t a2, std::uint64_t a3,
+                                  std::uint64_t a4) {
+    DeviceProxy* proxy = nullptr;
+    void* out = nullptr;
+    if (is_device_proxy(reinterpret_cast<const void*>(rdx))) {
+        proxy = reinterpret_cast<DeviceProxy*>(rdx);
+        out = reinterpret_cast<void*>(rcx);
+    } else if (is_device_proxy(reinterpret_cast<const void*>(rcx))) {
+        proxy = reinterpret_cast<DeviceProxy*>(rcx);
+        out = reinterpret_cast<void*>(rdx);
+    }
+    note_slot(Slot);
+    if (!proxy || !out || !proxy->real) return 0;
+    if constexpr (Slot == 25) {
+        *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(out) = proxy->real->GetResourceAllocationInfo(
+            static_cast<UINT>(a2), static_cast<UINT>(a3), reinterpret_cast<const D3D12_RESOURCE_DESC*>(a4));
+    } else if constexpr (Slot == 26) {
+        *static_cast<D3D12_HEAP_PROPERTIES*>(out) = proxy->real->GetCustomHeapProperties(
+            static_cast<UINT>(a2), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(a3)));
+    } else {
+        static_assert(Slot == 43);
+        *static_cast<LUID*>(out) = proxy->real->GetAdapterLuid();
+    }
+    return reinterpret_cast<std::uint64_t>(out);
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1506,6 +1564,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                   reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35 || Slot == 45 || Slot == 46 || Slot == 50) {
         return hr_to_u64(proxy_unwrapping_call<Slot>(self, a1, a2, a3, a4, a5));
+    } else if constexpr (Slot == 25 || Slot == 26 || Slot == 43) {
+        return proxy_struct_return<Slot>(reinterpret_cast<std::uint64_t>(self), a1, a2, a3, a4);
     } else if constexpr (Slot == 75) {
         return hr_to_u64(proxy_create_command_queue1(self, a1, a2, reinterpret_cast<const IID*>(a3),
                                                      reinterpret_cast<void**>(a4)));

@@ -694,6 +694,32 @@ LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_ty
 
 }  // namespace
 
+namespace rt::xmem {
+
+bool write_physical(const uint64_t* pages, size_t page_count, size_t offset, const void* data, size_t size) {
+    const auto* src = static_cast<const uint8_t*>(data);
+    const std::lock_guard lock(g_phys_mutex);
+    while (size) {
+        const size_t index = offset / kPhysicalPageSize, within = offset % kPhysicalPageSize;
+        if (index >= page_count) return false;
+        const auto it = g_pages.find(pages[index]);
+        if (it == g_pages.end()) return false;
+        const size_t n = std::min<size_t>(size, kPhysicalPageSize - within);
+        // A view of the page's own 64 KiB of its section, whether or not the title has mapped it anywhere.
+        void* view = MapViewOfFile(it->second.section->handle, FILE_MAP_WRITE, static_cast<DWORD>(it->second.offset >> 32),
+                                   static_cast<DWORD>(it->second.offset), kPhysicalPageSize);
+        if (!view) return false;
+        std::memcpy(static_cast<uint8_t*>(view) + within, src, n);
+        UnmapViewOfFile(view);
+        src += n;
+        offset += n;
+        size -= n;
+    }
+    return true;
+}
+
+}  // namespace rt::xmem
+
 #define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
 
 // The classic libraries and the memory api sets a title's imports name.
