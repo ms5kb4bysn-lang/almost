@@ -77,3 +77,26 @@ first run reported in #6603 stops earlier, in `D3D12ConfigureVirtualMemoryX`.
 
 Nothing here says that the boot reaches these calls, in what order, or what the commands and results carry. A site is code
 that can call; the first trace (`--trace`, `unimplemented_call` events) is the signal for which of them run.
+
+## Argument orders decoded for the boot shim (feat/acphal-shim, based on a6cfb4161)
+
+Reading the registers set immediately before each call (not only the counts above) settles five shapes that the table
+alone leaves open. `runtime/shims/acphal.cpp` implements them; its file header has the per-site evidence.
+
+- `AcpHalAllocateShapeContexts` takes **one pointer to a descriptor**, not an out pointer. At `+0x43aec4b` rcx is
+  the descriptor at RVA `0x9ae98d0`; the title writes the qword `0x15e` at descriptor `+0x10`, reads it back after the
+  call, and reads the array pointer the call must write from descriptor `+0x38`. It then memsets `count * 0x40` bytes
+  at `+0x43aec94` (the return address `+0x43aec99` is the crash this shim fixes). The field meanings are not measured.
+- `ApuCreateHeap` has **no out argument**. rcx is `0x1c7` or `0xff` from `+0x25a8750`, shifted left 20
+  (`0x1c700000` / `0xff00000`), and rdx is `0x226e00`. Writing a heap object through rcx would write to a 476 MiB
+  address; the heap is internal state.
+- `ApuAlloc`'s first argument is an **out pointer**, not a heap handle. The wrapper at `+0x43a6110` is called with rcx
+  pointing at a zeroed stack qword, and the caller reads that qword into r15 after the call at `+0x43aed18` and memsets
+  through it. A second caller at `+0x1e74620` passes the address of a global. The second argument is 0, the third the
+  size, the fourth `0x800`.
+- `ApuMapVirtualAddress` takes **the pointer alone**: the call at `+0x7879c` (and the other three) reloads only rcx;
+  the `0x40`/`0x80`/`0x800` in edx is the leftover size of the preceding `ApuIsVirtualAddressValid`.
+- `XApuConnect` takes **three pointers**: the two queue descriptors at RVA `0x9ae9890` and `0x9ae98a8`, then the out
+  handle `0x9ae8960` that every other xapu call reads. The first qword of the second descriptor is later read as the
+  command buffer base (`+0x4e64b45`, `+0x4f20afe`, `+0x4f20b64`); its init at `+0x5a8797c` only zeroes it and no other
+  direct write in the image was found, so connect is the likely filler.
