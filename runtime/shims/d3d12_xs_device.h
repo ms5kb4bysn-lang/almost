@@ -96,6 +96,11 @@ ID3D12Device* device_proxy_real_device(const void* device);
 using CreateAtAddressFn = HRESULT (*)(ID3D12Device* real, UINT64 address, const D3D12_RESOURCE_DESC* desc,
                                       REFIID riid, void** out);
 void set_create_at_address(CreateAtAddressFn fn);
+// Device slot 14 with a placed heap (the console description's address and size after the PC fields), answered by
+// the backend that registers here; unset, such a heap is created as a PC one.
+using CreateHeapAtFn = HRESULT (*)(ID3D12Device* real, const D3D12_DESCRIPTOR_HEAP_DESC* desc, UINT64 address,
+                                   REFIID riid, void** out);
+void set_create_heap_at(CreateHeapAtFn fn);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and

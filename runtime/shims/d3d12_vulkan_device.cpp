@@ -1808,8 +1808,21 @@ public:
     // heaps (RTV, DSV, non-visible staging heaps) stay in host memory.
     // A shader-visible heap that the arena cannot hold is not created (ok() is false, E_OUTOFMEMORY), as a
     // default-heap buffer is not: in host memory its GPU handle would be 0, and every table would read VA 0.
-    DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc) : device_(device), desc_(desc) {
+    // `placed`: memory the title allocated for the heap itself (the console's heap description carries its address;
+    // see rt::d3d12::create_descriptor_heap_at). The heap is that memory, as it is (not zeroed), and is not given back
+    // when the heap goes. A shader-visible placed heap needs the unified arena, where its GPU start is that address.
+    DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc, std::uintptr_t placed = 0)
+        : device_(device), desc_(desc) {
         const VkDeviceSize bytes = VkDeviceSize(desc.NumDescriptors) * kDescriptorSize;
+        if (placed) {
+            const bool visible = (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0;
+            if (visible && (!device.arena.unified || placed + bytes > device.arena.size)) return;  // ok() is false
+            cpu_ = reinterpret_cast<std::uint8_t*>(placed);
+            arena_offset_ = placed;
+            in_arena_ = visible;
+            owned_ = false;
+            return;
+        }
         if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.cpu()) {
             if (!device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
                 log_once("GPU address arena full (raise LEONIDA_ARENA_MB); shader-visible heap size in KiB:",
@@ -1826,8 +1839,9 @@ public:
     }
 
     ~DescriptorHeap() override {
-        if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize,
-                                            DeviceState::arena_descriptor_heap);
+        if (in_arena_ && owned_)
+            device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize,
+                                  DeviceState::arena_descriptor_heap);
     }
 
     bool ok() const { return cpu_ != nullptr; }
@@ -1857,6 +1871,7 @@ private:
     std::uint8_t* cpu_ = nullptr;
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
+    bool owned_ = true;  // false for a heap in memory the title placed it in
 };
 
 class Resource final
@@ -5999,6 +6014,32 @@ public:
         return d3d12_trace::result(method, hand_out(heap, riid, out));
     }
 
+public:
+    // A descriptor heap in memory the title allocated for it (the console's heap description carries the address and
+    // size; d3d12_xs_device.cpp slot 14). Its CPU start is that address, and for a shader-visible heap (unified arena
+    // only) so is its GPU start. E_NOTIMPL when a shader-visible heap cannot be placed there.
+    HRESULT create_descriptor_heap_at(const D3D12_DESCRIPTOR_HEAP_DESC& desc, std::uintptr_t address, REFIID riid,
+                                      void** out) {
+        constexpr auto method = "XboxDevice::CreateDescriptorHeap(placed)";
+        if (out) *out = nullptr;
+        if (!address || !out) return d3d12_trace::result(method, E_INVALIDARG);
+        auto* heap = new DescriptorHeap(state_, desc, address);
+        heap->attach_device(identity());
+        if (!heap->ok()) {
+            heap->Release();
+            log_once("shader-visible heap at a title address needs the unified arena (LEONIDA_UNIFIED_GB); type",
+                     desc.Type);
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr, "[rt] d3d12: descriptor heap at the title's address 0x%llx (%u descriptors, type %d)\n",
+                         static_cast<unsigned long long>(address), desc.NumDescriptors, int(desc.Type));
+        return d3d12_trace::result(method, hand_out(heap, riid, out));
+    }
+
+private:
+
     HRESULT STDMETHODCALLTYPE CreateQueryHeap(const D3D12_QUERY_HEAP_DESC* desc, REFIID riid, void** out) override {
         if (out) *out = nullptr;
         // The host runtime's order (compare_invalid_arguments, "query heap:"): the description first, refused with
@@ -8725,10 +8766,21 @@ HRESULT create_buffer_at_address(ID3D12Device* device, UINT64 address, const D3D
     return E_NOTIMPL;  // a PC runtime device: no title-mapped resources
 }
 
+HRESULT create_descriptor_heap_at(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc, UINT64 address,
+                                  REFIID riid, void** out) {
+    if (out) *out = nullptr;
+    if (!device || !desc) return E_INVALIDARG;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (auto* d = Device::from<Device>(real ? real : device))
+        return d->create_descriptor_heap_at(*desc, static_cast<std::uintptr_t>(address), riid, out);
+    return E_NOTIMPL;
+}
+
 namespace {
-// The proxy's device slot 133 reaches create_buffer_at_address through its hook (d3d12_xs_device.h).
+// The proxy's device slots 133 and 14 (a placed heap) reach the layer through their hooks (d3d12_xs_device.h).
 const bool g_registered_create_at_address = [] {
     rt::d3d12_xs::set_create_at_address(&create_buffer_at_address);
+    rt::d3d12_xs::set_create_heap_at(&create_descriptor_heap_at);
     return true;
 }();
 }  // namespace

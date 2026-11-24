@@ -226,6 +226,9 @@ bool device_supports_ray_tracing(ID3D12Device* device);
 // arena (LEONIDA_UNIFIED_GB). E_NOTIMPL without it, or for a texture.
 HRESULT create_buffer_at_address(ID3D12Device* device, UINT64 address, const D3D12_RESOURCE_DESC* desc, REFIID riid,
                                  void** out);
+// A descriptor heap in memory the title allocated for it at `address` (Xbox device slot 14 with a placed heap).
+HRESULT create_descriptor_heap_at(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc, UINT64 address,
+                                  REFIID riid, void** out);
 // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.
 VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D3D12_GPU_VIRTUAL_ADDRESS va);
 

@@ -1618,6 +1618,16 @@ HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t
     return static_cast<HRESULT>(static_cast<std::uint32_t>(forward_device<Slot>(self, r1, r2, r3, r4, a5)));
 }
 
+std::atomic<CreateAtAddressFn> g_create_at_address{nullptr};
+std::atomic<CreateHeapAtFn> g_create_heap_at{nullptr};
+
+void log_once_placed_heap(HRESULT hr, std::uint64_t address) {
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true))
+        std::fprintf(stderr, "[rt] d3d12_xs: placed descriptor heap at 0x%llx refused (0x%08lx); made as a PC heap\n",
+                     static_cast<unsigned long long>(address), static_cast<unsigned long>(hr));
+}
+
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
     note_slot(14);
@@ -1627,7 +1637,26 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     if (!out) return self->real->CreateDescriptorHeap(desc, *riid, nullptr);
 
     void* created = nullptr;
-    HRESULT hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
+    HRESULT hr = E_FAIL;
+    // A placed heap: the console's description goes on after the PC fields with the address of memory the title
+    // allocated for the heap and its size (game_scarlett_master.exe 1.0.2.1 builds {type, count, flags, node mask 1,
+    // address, count * increment} at exe+0x1cf32a3..0x1cf32d5 and breaks at exe+0x1cf336c unless
+    // GetCPUDescriptorHandleForHeapStart returns that address). Taken as placed only when the size is exactly count *
+    // the device's increment, so a PC description followed by other bytes is not.
+    const CreateHeapAtFn create_at = g_create_heap_at.load(std::memory_order_acquire);
+    bool placed = false;
+    if (desc && create_at) {
+        std::uint64_t extra[2] = {};
+        std::memcpy(extra, reinterpret_cast<const std::uint8_t*>(desc) + sizeof(D3D12_DESCRIPTOR_HEAP_DESC),
+                    sizeof(extra));
+        const std::uint64_t increment = self->real->GetDescriptorHandleIncrementSize(desc->Type);
+        if (extra[0] && increment && extra[1] == std::uint64_t(desc->NumDescriptors) * increment) {
+            hr = create_at(self->real, desc, extra[0], __uuidof(ID3D12DescriptorHeap), &created);
+            placed = SUCCEEDED(hr);
+            if (!placed) log_once_placed_heap(hr, extra[0]);
+        }
+    }
+    if (!placed) hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
     if (FAILED(hr) || !created) return FAILED(hr) ? hr : E_FAIL;
 
     ID3D12DescriptorHeap* heap = static_cast<ID3D12DescriptorHeap*>(created);
@@ -1799,7 +1828,6 @@ std::uint64_t proxy_struct_return(std::uint64_t rcx, std::uint64_t rdx, std::uin
     return reinterpret_cast<std::uint64_t>(out);
 }
 
-std::atomic<CreateAtAddressFn> g_create_at_address{nullptr};
 
 // Device slot 133: (address, D3D12_RESOURCE_DESC1*, barrier layout, clear value, riid, out) (game_scarlett_master.exe
 // 1.0.2.1 at exe+0x1e8684c, layout 0xffffffff = undefined; VIctory device.rs create_at_address and XCL device_x.rs
@@ -2061,6 +2089,8 @@ bool is_allocator_proxy(const void* allocator) { return is_child_proxy<ChildKind
 bool is_list_proxy(const void* list) { return is_list_proxy_object(list); }
 
 void set_create_at_address(CreateAtAddressFn fn) { g_create_at_address.store(fn, std::memory_order_release); }
+
+void set_create_heap_at(CreateHeapAtFn fn) { g_create_heap_at.store(fn, std::memory_order_release); }
 
 ID3D12GraphicsCommandList* list_proxy_real_list(const void* list) {
     if (!is_list_proxy_object(list)) return nullptr;
