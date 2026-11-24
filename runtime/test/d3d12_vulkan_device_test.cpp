@@ -590,6 +590,11 @@ int compare_footprints(ID3D12Device* ours) {
 int compare_allocation_info(ID3D12Device* ours) {
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
+    // The Xbox device table matches the PC's only up to slot 43 (console_slot_map): ID3D12Device4/8's
+    // GetResourceAllocationInfo1/2 are not console methods, so the device proxy is not asked for them here (a call
+    // through its console vtable would hand the PC struct-return convention a thunk that reads the output buffer as
+    // `this`). GetResourceAllocationInfo itself (slot 25) is the console's and is compared as usual.
+    const bool proxy = rt::d3d12_xs::is_device_proxy(ours);
     const auto with = [](D3D12_RESOURCE_DESC desc, UINT64 alignment, UINT samples = 1) {
         desc.Alignment = alignment;
         desc.SampleDesc.Count = samples;
@@ -856,6 +861,12 @@ int compare_allocation_info(ID3D12Device* ours) {
     for (const Case& c : cases) {
         const D3D12_RESOURCE_ALLOCATION_INFO a = ours->GetResourceAllocationInfo(0, 1, &c.desc);
         const D3D12_RESOURCE_ALLOCATION_INFO b = host->GetResourceAllocationInfo(0, 1, &c.desc);
+        if (proxy) {
+            // The console's sizes and alignment are its own (4 KiB for a small texture where the PC says 64 KiB);
+            // only the capability answer, valid or UINT64_MAX, is comparable with the PC runtime.
+            if ((a.SizeInBytes != UINT64_MAX) != (b.SizeInBytes != UINT64_MAX)) mismatch(c.name, a, b);
+            continue;
+        }
         if (c.top_mip_bytes && b.SizeInBytes == UINT64_MAX && c.desc.SampleDesc.Count > 1 &&
             c.desc.Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE) {
             D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS ms{
@@ -880,6 +891,7 @@ int compare_allocation_info(ID3D12Device* ours) {
                     (unsigned long long)a.Alignment, (unsigned long long)a.SizeInBytes,
                     (unsigned long long)b.SizeInBytes);
     }
+    if (proxy) return mismatches;
 
     // Several resources at once: each at its own alignment after the one before, the largest alignment overall.
     // Buffers only for the host comparison (their sizes are fixed); the texture checks our own layout.
@@ -951,7 +963,7 @@ int compare_allocation_info(ID3D12Device* ours) {
                 const auto ib = host->GetResourceAllocationInfo(mask, count, descs);
                 if (!same_info(ia, ib)) mismatch(name, ia, ib);
             }
-            if (ours4.p && host4.p) {
+            if (!proxy && ours4.p && host4.p) {
                 const D3D12_RESOURCE_ALLOCATION_INFO1 sentinel{0xdead, 0xbeef, 0xcafe};
                 D3D12_RESOURCE_ALLOCATION_INFO1 each_a = sentinel, each_b = sentinel;
                 const auto ia = ours4->GetResourceAllocationInfo1(mask, 1, &buffer, &each_a);
@@ -960,7 +972,7 @@ int compare_allocation_info(ID3D12Device* ours) {
                     each_a.Alignment != each_b.Alignment)
                     mismatch("visible mask, GetResourceAllocationInfo1", ia, ib);
             }
-            if (ours8_mask.p && host8_mask.p) {
+            if (!proxy && ours8_mask.p && host8_mask.p) {
                 const D3D12_RESOURCE_ALLOCATION_INFO1 sentinel{0xdead, 0xbeef, 0xcafe};
                 D3D12_RESOURCE_ALLOCATION_INFO1 each_a = sentinel, each_b = sentinel;
                 const auto ia = ours8_mask->GetResourceAllocationInfo2(mask, 1, &buffer1, &each_a);

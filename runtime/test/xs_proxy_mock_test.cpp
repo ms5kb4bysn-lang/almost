@@ -481,17 +481,20 @@ int check_create_failures() {
     mock->create_result = E_OUTOFMEMORY;  // the real failure, passed on
     out = reinterpret_cast<void*>(1);
     EXPECT(hr_of(raw(device, 8, word(&kQueueDesc), word(&kQueueIid), word(&out))) == E_OUTOFMEMORY && !out);
-    out = reinterpret_cast<void*>(1);
-    EXPECT(hr_of(raw(device, 75, word(&kQueueDesc), 0, word(&kQueueIid), word(&out))) == E_OUTOFMEMORY && !out);
     mock->create_result = S_OK;
+
+    // Console slots 74/75 (RegisterPagePoolX/UnregisterPagePoolX): answered by the proxy, never the PC device.
+    const unsigned calls74 = mock->calls[74], calls75 = mock->calls[75];
+    std::uint32_t pool_index = 0xffffffffu;
+    EXPECT(hr_of(raw(device, 74, 0x10000, 16, word(&pool_index))) == S_OK && pool_index != 0xffffffffu);
+    EXPECT(hr_of(raw(device, 75, pool_index)) == S_OK);
+    EXPECT(mock->calls[74] == calls74 && mock->calls[75] == calls75);
 
     const unsigned calls8 = mock->calls[8];
     out = reinterpret_cast<void*>(1);  // a null IID: E_POINTER, the output cleared, nothing created
     EXPECT(hr_of(raw(device, 8, word(&kQueueDesc), 0, word(&out))) == E_POINTER && !out && mock->calls[8] == calls8);
     out = reinterpret_cast<void*>(1);
     EXPECT(hr_of(raw(device, 36, 0, 0, 0, word(&out))) == E_POINTER && !out);
-    out = reinterpret_cast<void*>(1);
-    EXPECT(hr_of(raw(device, 75, word(&kQueueDesc), 0, 0, word(&out))) == E_POINTER && !out);
     // No output: the device's own answer (S_FALSE here), as the PC runtime gives it.
     EXPECT(hr_of(raw(device, 8, word(&kQueueDesc), word(&kQueueIid), 0)) == S_FALSE && mock->calls[8] == calls8 + 1);
     EXPECT(hr_of(raw(device, 36, 0, 0, word(&kFenceIid), 0)) == S_FALSE);
@@ -602,15 +605,16 @@ int check_alloc_failures() {
         many_fences[i] = word(fence);
         values[i] = 1;
     }
-    const unsigned calls34 = mock->calls[34], calls45 = mock->calls[45], calls46 = mock->calls[46];
-    const unsigned calls50 = mock->calls[50];
+    const unsigned calls34 = mock->calls[34], calls35 = mock->calls[35], calls45 = mock->calls[45];
+    const unsigned calls46 = mock->calls[46], calls50 = mock->calls[50];
     EXPECT(failing([&] { return hr_of(raw(device, 34, kLong, word(many))); }) == E_OUTOFMEMORY);
-    EXPECT(failing([&] { return hr_of(raw(device, 45, word(many_fences), word(values), kLong, 0, 0)); }) ==
-           E_OUTOFMEMORY);
-    EXPECT(failing([&] { return hr_of(raw(device, 46, kLong, word(many), word(priorities))); }) == E_OUTOFMEMORY);
-    EXPECT(failing([&] { return hr_of(raw(device, 50, 0, kLong, word(many), word(fence), 1)); }) == E_OUTOFMEMORY);
-    EXPECT(mock->calls[34] == calls34 && mock->calls[45] == calls45 && mock->calls[46] == calls46 &&
-           mock->calls[50] == calls50);  // nothing reached the device
+    EXPECT(failing([&] { return hr_of(raw(device, 35, kLong, word(many))); }) == E_OUTOFMEMORY);
+    // 45/46/50 are console methods now: 45/46 are refused, 50 is accepted, and the device is never reached.
+    EXPECT(hr_of(raw(device, 45, word(many_fences), word(values), kLong, 0, 0)) == E_NOTIMPL);
+    EXPECT(hr_of(raw(device, 46, kLong, word(many), word(priorities))) == E_NOTIMPL);
+    EXPECT(hr_of(raw(device, 50, 0, kLong, word(many), word(fence), 1)) == S_OK);
+    EXPECT(mock->calls[34] == calls34 && mock->calls[35] == calls35 && mock->calls[45] == calls45 &&
+           mock->calls[46] == calls46 && mock->calls[50] == calls50);  // nothing reached the device
     // And without the failure the long array arrives unwrapped.
     EXPECT(hr_of(raw(device, 34, kLong, word(many))) == S_OK && mock->calls[34] == calls34 + 1);
     EXPECT(mock->array[34][0] == word(xs::queue_proxy_real_queue(queue)) &&
@@ -631,7 +635,7 @@ int check_alloc_failures() {
     EXPECT(release(queue) == 0 && release(fence) == 0 && queue_mock->refs == 0 && fence_mock->refs == 0);
     EXPECT(xs::device_proxy_ref_count(device) == device_refs);
     EXPECT(release(device) == 0 && mock->refs == 0);
-    std::printf("%s: a refused allocation in queue, fence, shared-fence and device proxy creation and in the four "
+    std::printf("%s: a refused allocation in queue, fence, shared-fence and device proxy creation and in the two "
                 "unwrapped arrays returns E_OUTOFMEMORY, reaches no device and leaks nothing\n", g_label);
     return 0;
 }
@@ -867,12 +871,23 @@ int check_tail(bool want_guarded) {
     EXPECT(queue && fence);
     EXPECT(xs::command_object_tables_guarded() == want_guarded);
     Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
-    // Signal (14) still reaches the real queue, with the real fence.
-    EXPECT(hr_of(raw(queue, 14, word(fence), 5)) == S_OK && queue_mock->calls[14] == 1 &&
+    // The console's newer queue layout: 14/15 are the console's own methods and stay in the proxy; Signal is 16,
+    // which reaches the real queue's PC slot 14 with the real fence.
+    EXPECT(hr_of(raw(queue, 14, word(fence), 5)) == S_OK && queue_mock->calls[14] == 0);
+    EXPECT(hr_of(raw(queue, 16, word(fence), 5)) == S_OK && queue_mock->calls[14] == 1 &&
            queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
-    for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot)
+    // GetDesc (20, and 28 where a source puts it) forwards to the real queue's PC slot 18.
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    raw(queue, 20, word(&desc));
+    EXPECT(queue_mock->calls[18] == 1);
+    raw(queue, 28, word(&desc));
+    EXPECT(queue_mock->calls[18] == 2);
+    // Everything from 36 (past ExecuteCommandListsX at 35) to the end of the table is refused.
+    for (unsigned slot = 36; slot < xs::queue_proxy_table_size(); ++slot)
         EXPECT(hr_of(raw(queue, slot)) == E_NOTIMPL && queue_mock->calls[slot] == 0);
-    for (unsigned slot = 12; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
+    // Fence slot 12 is the console's GetGpuAddress (a cell address), so the refused range starts at 13.
+    for (unsigned slot = 13; slot < xs::fence_proxy_table_size(); ++slot)
+        EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
     EXPECT(release(queue) == 0 && release(fence) == 0 && release(device) == 0 && mock->refs == 0);
     return 0;
@@ -919,6 +934,30 @@ int check_struct_returns() {
         EXPECT(call(&luid, 43) == word(&luid));
         EXPECT(luid.LowPart == 0x89abcdef && luid.HighPart == 0x1234 && mock->calls[43] == calls43 + 1);
     }
+    // A texture the console layout model knows gets the console's size and alignment, and the PC runtime is not
+    // asked; the zeroed descriptions above are not textures and still go to the PC.
+    D3D12_RESOURCE_DESC texture{};
+    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture.Width = 512;
+    texture.Height = 512;
+    texture.DepthOrArraySize = 1;
+    texture.MipLevels = 10;
+    texture.Format = DXGI_FORMAT_BC7_UNORM;
+    texture.SampleDesc.Count = 1;
+    {
+        D3D12_RESOURCE_ALLOCATION_INFO info;
+        std::memset(&info, 0xcd, sizeof(info));
+        const unsigned before25 = mock->calls[25];
+        EXPECT(raw(device, 25, word(&info), 0, 1, word(&texture)) == word(&info));
+        EXPECT(info.SizeInBytes == 0x56000 && info.Alignment == 0x1000);  // the measured console number
+        EXPECT(mock->calls[25] == before25);
+        // Two descriptions add their sizes; the stricter alignment wins.
+        D3D12_RESOURCE_DESC pair[] = {texture, texture};
+        EXPECT(raw_rcx_first(device, &info, 25, word(device), 0, 2, word(pair)) == word(&info));
+        EXPECT(info.SizeInBytes == 2 * 0x56000 && info.Alignment == 0x1000);
+        EXPECT(mock->calls[25] == before25);
+    }
+
     // Neither word a device proxy: 0, the PC device not called, the buffers untouched.
     std::uint64_t first[4] = {0, 0, 0, 0}, second[4] = {0, 0, 0, 0};
     const unsigned calls25 = mock->calls[25];
@@ -1043,9 +1082,16 @@ int check_list_slot_map() {
     EXPECT(raw(list, 131, 1, 2, 3, 4) == 0 && raw(list, 132, 1, 2, 3, 4) == 0 && raw(list, 142, 5) == 0);
     EXPECT(total_calls(real) == before);
     // Console-only or unmapped slots: 0 and nothing reached.
-    EXPECT(raw(list, 59, 1) == 0 && raw(list, 60, 1) == 0 && raw(list, 100, 1) == 0 && raw(list, 146, 1, 2) == 0 &&
-           raw(list, 148, 64, 16) == 0);
+    EXPECT(raw(list, 59, 1) == 0 && raw(list, 60, 1) == 0 && raw(list, 100, 1) == 0);
     EXPECT(total_calls(real) == before);
+    // 146 (barrier groups): one global UAV barrier through the PC list's ResourceBarrier (slot 26).
+    const unsigned calls26 = real->calls[26];
+    EXPECT(raw(list, 146, 3, 0x9000) == 0 && real->calls[26] == calls26 + 1 &&
+           static_cast<std::uint32_t>(real->args[26][0]) == 1 && real->args[26][1] != 0);
+    // 148 (AllocateUploadMemory): no unified range in this build, so null; the call reaches nothing.
+    const unsigned after_groups = total_calls(real);
+    EXPECT(raw(list, 148, 64, 16) == 0 && total_calls(real) == after_groups);
+    before = after_groups;
 
     // 139 ResetX(allocator, pipeline, flags) -> PC 10 Reset(allocator, pipeline), the allocator proxy unwrapped.
     EXPECT(hr_of(raw(list, 139, word(allocator), 0x8888, 0xff)) == S_OK);
@@ -1060,7 +1106,8 @@ int check_list_slot_map() {
     EXPECT(release(allocator) == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: console list slots reach their PC slots (32->28 heaps unwrapped, 28->52, 29->53, 50->46, 51->47, "
-                "61->59, 139->10 allocator unwrapped); 131/132/142 and console-only slots reach nothing\n", g_label);
+                "61->59, 139->10 allocator unwrapped, 146->one UAV barrier); 131/132/142 and console-only slots reach "
+                "nothing\n", g_label);
     return 0;
 }
 
@@ -1297,6 +1344,35 @@ static void no_dialogs() {
     SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 }
 
+// ---- 14. Console pipeline-state slots ----
+
+int check_pipeline_slots() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    // 86 CreatePipelineState(stream desc, riid, out) -> the PC Device2 method at 47, the description passed as it is.
+    struct {
+        std::uint64_t type, payload;
+    } stream[] = {{2, 0x1234}};  // a GLOBAL_ROOT_SIGNATURE subobject
+    D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(stream), stream};
+    const IID iid = __uuidof(ID3D12PipelineState);
+    void* out = reinterpret_cast<void*>(1);
+    const unsigned calls47 = mock->calls[47];
+    EXPECT(hr_of(raw(device, 86, word(&desc), word(&iid), word(&out))) == S_OK);
+    EXPECT(mock->calls[47] == calls47 + 1 && mock->args[47][0] == word(&desc) && mock->args[47][1] == word(&iid) &&
+           mock->args[47][2] == word(&out) && !out);
+    EXPECT(hr_of(raw(device, 86, word(&desc), 0, word(&out))) == E_POINTER && mock->calls[47] == calls47 + 1);
+    // 57 DeserializeGraphicsPipelineStateX(state, riid, out): refused, the output cleared, no PC method reached.
+    const unsigned calls = total_calls(mock);
+    out = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw(device, 57, 0x1234, word(&iid), word(&out))) == E_NOTIMPL && !out);
+    EXPECT(total_calls(mock) == calls);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: slot 86 forwards the stream to PC 47; slot 57 clears its output and refuses without reaching "
+                "the device\n", g_label);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1308,7 +1384,7 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_struct_returns() ||
-        check_queue_flags() || check_list_slot_map() || check_placed_hooks())
+        check_queue_flags() || check_list_slot_map() || check_placed_hooks() || check_pipeline_slots())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

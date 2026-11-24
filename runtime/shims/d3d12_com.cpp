@@ -839,6 +839,7 @@ public:
                 kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
                 : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
                 : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
+                : kind == leonida::IndirectKind::dispatch_mesh ? sizeof(D3D12_DISPATCH_MESH_ARGUMENTS)
                 : 0;
             if (!record_size || stride < record_size || stride % 4 != 0)
                 return check(false);

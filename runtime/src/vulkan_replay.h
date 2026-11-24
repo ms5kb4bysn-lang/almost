@@ -1542,6 +1542,7 @@ inline VkDeviceSize indirect_record_size(IndirectKind kind) {
     case IndirectKind::draw: return sizeof(VkDrawIndirectCommand);
     case IndirectKind::draw_indexed: return sizeof(VkDrawIndexedIndirectCommand);
     case IndirectKind::dispatch: return sizeof(VkDispatchIndirectCommand);
+    case IndirectKind::dispatch_mesh: return sizeof(VkDispatchIndirectCommand);  // three 32-bit group counts
     }
     return 0;
 }
@@ -2993,6 +2994,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             out.queries.push_back({i, heap, statistics_active});
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
+            // Mesh-work records are accepted at signature creation (the title builds a DISPATCH_MESH signature at
+            // boot) but the replay has no mesh-indirect path yet: refuse at execution rather than run the record as
+            // a draw or a compute dispatch.
+            if (ind->kind == IndirectKind::dispatch_mesh) return ReplayResult::unsupported;
             if (!bind(ind->argument_buffer) || !p.binding.buffer) return ReplayResult::unresolved_resource;
             const VkDeviceSize record_size = detail::indirect_record_size(ind->kind);
             if (!record_size || ind->stride < record_size || ind->stride % sizeof(std::uint32_t))

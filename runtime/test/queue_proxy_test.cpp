@@ -92,6 +92,37 @@ std::uint64_t raw_call(void* object, unsigned slot, std::uint64_t a1 = 0, std::u
     return reinterpret_cast<SlotFn>(vtable[slot])(object, a1, a2, a3, a4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
+// The queue proxy speaks the console's newer queue layout (game_scarlett_master.exe; console_slot_map §3): two
+// console methods at 14/15 push the PC's Signal/Wait to 16/17, GetTimestampFrequency/GetClockCalibration to 18/19
+// and GetDesc to 20. A real queue keeps the PC order. These call whichever one they are given.
+HRESULT queue_signal(ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64 value) {
+    if (!xs::is_queue_proxy(queue)) return queue->Signal(fence, value);
+    return as_hr(raw_call(queue, 16, reinterpret_cast<std::uint64_t>(fence), value));
+}
+
+HRESULT queue_wait(ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64 value) {
+    if (!xs::is_queue_proxy(queue)) return queue->Wait(fence, value);
+    return as_hr(raw_call(queue, 17, reinterpret_cast<std::uint64_t>(fence), value));
+}
+
+HRESULT queue_frequency(ID3D12CommandQueue* queue, UINT64* frequency) {
+    if (!xs::is_queue_proxy(queue)) return queue->GetTimestampFrequency(frequency);
+    return as_hr(raw_call(queue, 18, reinterpret_cast<std::uint64_t>(frequency)));
+}
+
+HRESULT queue_calibration(ID3D12CommandQueue* queue, UINT64* gpu, UINT64* cpu) {
+    if (!xs::is_queue_proxy(queue)) return queue->GetClockCalibration(gpu, cpu);
+    return as_hr(raw_call(queue, 19, reinterpret_cast<std::uint64_t>(gpu), reinterpret_cast<std::uint64_t>(cpu)));
+}
+
+// GetDesc is a struct return: the hidden pointer is the first declared argument (RCX = this, RDX = the buffer).
+D3D12_COMMAND_QUEUE_DESC queue_description(ID3D12CommandQueue* queue) {
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    if (!xs::is_queue_proxy(queue)) return queue->GetDesc();
+    raw_call(queue, 20, reinterpret_cast<std::uint64_t>(&desc));
+    return desc;
+}
+
 // ---- Structured-exception guards (no C++ objects in these frames) ----
 
 ULONG_PTR g_fault_address = 0;
@@ -270,7 +301,7 @@ int check_slots(const Backend& b) {
             before = qhits(10);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(qhits(10) == before + 1);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 6)));
+            EXPECT(SUCCEEDED(queue_signal(queue.p, fence.p, 6)));
             if (wait_for(label, fence.p, 6)) return 1;
             if (b.vulkan) {
                 // The layer's own helpers find their queue behind the proxy.
@@ -291,15 +322,16 @@ int check_slots(const Backend& b) {
         queue->EndEvent();
         EXPECT(qhits(13) == before + 1);
 
-        // 14/15: Signal and Wait take fence proxies; the real queue gets the real fences.
-        before = qhits(14);
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 7)));
-        EXPECT(qhits(14) == before + 1);
+        // 16/17: Signal and Wait (the console's newer layout puts its own methods at 14/15); they take fence
+        // proxies, and the real queue gets the real fences.
+        before = qhits(16);
+        EXPECT(SUCCEEDED(queue_signal(queue.p, fence.p, 7)));
+        EXPECT(qhits(16) == before + 1);
         if (wait_for(label, fence.p, 7)) return 1;
-        before = qhits(15);
-        EXPECT(SUCCEEDED(queue->Wait(fence.p, 8)));  // the queue waits until the CPU signals 8
-        EXPECT(qhits(15) == before + 1);
-        EXPECT(SUCCEEDED(queue->Signal(second.p, 1)));
+        before = qhits(17);
+        EXPECT(SUCCEEDED(queue_wait(queue.p, fence.p, 8)));  // the queue waits until the CPU signals 8
+        EXPECT(qhits(17) == before + 1);
+        EXPECT(SUCCEEDED(queue_signal(queue.p, second.p, 1)));
         Sleep(50);
         EXPECT(second->GetCompletedValue() == 0);  // still held by the Wait
         before = fhits(10);
@@ -312,30 +344,57 @@ int check_slots(const Backend& b) {
             Ref<ID3D12Fence> raw;
             EXPECT(SUCCEEDED(b.real->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&raw.p))));
             EXPECT(!xs::is_fence_proxy(raw.p));
-            EXPECT(SUCCEEDED(queue->Signal(raw.p, 3)));
+            EXPECT(SUCCEEDED(queue_signal(queue.p, raw.p, 3)));
             if (wait_for(label, raw.p, 3)) return 1;
         }
 
-        // 16-18.
+        // 18-20: the PC's GetTimestampFrequency/GetClockCalibration/GetDesc, moved by the console layout.
         UINT64 frequency = 0;
-        before = qhits(16);
-        EXPECT(SUCCEEDED(queue->GetTimestampFrequency(&frequency)) && frequency > 0);
-        EXPECT(qhits(16) == before + 1);
-        UINT64 gpu = 0, cpu = 0;
-        before = qhits(17);
-        EXPECT(SUCCEEDED(queue->GetClockCalibration(&gpu, &cpu)) && cpu > 0);
-        EXPECT(qhits(17) == before + 1);
         before = qhits(18);
-        EXPECT(queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT);  // struct through the hidden pointer
+        EXPECT(SUCCEEDED(queue_frequency(queue.p, &frequency)) && frequency > 0);
         EXPECT(qhits(18) == before + 1);
+        UINT64 gpu = 0, cpu = 0;
+        before = qhits(19);
+        EXPECT(SUCCEEDED(queue_calibration(queue.p, &gpu, &cpu)) && cpu > 0);
+        EXPECT(qhits(19) == before + 1);
+        before = qhits(20);
+        EXPECT(queue_description(queue.p).Type == D3D12_COMMAND_LIST_TYPE_DIRECT);  // hidden pointer, not a PC slot
+        EXPECT(qhits(20) == before + 1);
+        // GetDesc's console number is not settled ([V] 20, [X] 28), so both answer.
+        D3D12_COMMAND_QUEUE_DESC desc28{};
+        before = qhits(28);
+        raw_call(queue.p, 28, reinterpret_cast<std::uint64_t>(&desc28));  // a struct return, not an HRESULT
+        EXPECT(desc28.Type == D3D12_COMMAND_LIST_TYPE_DIRECT);
+        EXPECT(qhits(28) == before + 1);
         D3D12_COMMAND_QUEUE_DESC compute_desc{};
         compute_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
         compute_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
         Ref<ID3D12CommandQueue> compute;
         EXPECT(SUCCEEDED(device->CreateCommandQueue(&compute_desc, IID_PPV_ARGS(&compute.p))));
-        const D3D12_COMMAND_QUEUE_DESC compute_back = compute->GetDesc();
+        const D3D12_COMMAND_QUEUE_DESC compute_back = queue_description(compute.p);
         EXPECT(xs::is_queue_proxy(compute.p) && compute_back.Type == D3D12_COMMAND_LIST_TYPE_COMPUTE);
         EXPECT(compute_back.Priority == D3D12_COMMAND_QUEUE_PRIORITY_HIGH);
+
+        // The console methods the newer layout adds: 14/15, 23/24 (suspend/resume), 31 (CopyPageMappingsBatchX)
+        // and 32 (PresentX) are answered by the proxy, 25/34 signal like SignalX, and 35 submits lists.
+        for (unsigned slot : {14u, 15u, 23u, 24u, 31u, 32u}) {
+            before = qhits(slot);
+            EXPECT(as_hr(raw_call(queue.p, slot)) == S_OK);
+            EXPECT(qhits(slot) == before + 1);
+        }
+        EXPECT(SUCCEEDED(as_hr(raw_call(queue.p, 25, reinterpret_cast<std::uint64_t>(fence.p), 9))));
+        if (wait_for(label, fence.p, 9)) return 1;
+        EXPECT(SUCCEEDED(as_hr(raw_call(queue.p, 34, reinterpret_cast<std::uint64_t>(fence.p), 10))));
+        if (wait_for(label, fence.p, 10)) return 1;
+        before = qhits(35);
+        EXPECT(SUCCEEDED(as_hr(raw_call(queue.p, 35, 0, 0, 0, 0))));  // zero lists is a valid empty submission
+        EXPECT(qhits(35) == before + 1);
+        // The console numbers the proxy does not implement are refused, not forwarded to an unrelated PC method.
+        for (unsigned slot : {21u, 22u, 26u, 27u, 29u, 30u, 33u}) {
+            before = qhits(slot);
+            EXPECT(as_hr(raw_call(queue.p, slot)) == E_NOTIMPL);
+            EXPECT(qhits(slot) == before + 1);
+        }
 
         // Every public fence slot.
         before = fhits(4);
@@ -359,7 +418,7 @@ int check_slots(const Backend& b) {
             EXPECT(fhits(7) == before + 1);
         }
         before = fhits(8);
-        EXPECT(fence->GetCompletedValue() == 8);
+        EXPECT(fence->GetCompletedValue() == 10);  // 6, 7, the CPU's 8, then SignalX (25) 9 and SignalWithSync (34) 10
         EXPECT(fhits(8) == before + 1);
         {
             Event done;
@@ -374,35 +433,40 @@ int check_slots(const Backend& b) {
             EXPECT(fence1->GetCreationFlags() == D3D12_FENCE_FLAG_NONE);
             EXPECT(fhits(11) == before + 1);
         }
+        // Fence slot 12: GetGpuAddress returns a cache-line-aligned cell that follows the completed value.
+        before = fhits(12);
+        const std::uint64_t cell = raw_call(fence.p, 12);
+        EXPECT(cell != 0 && cell % 64 == 0);
+        EXPECT(fhits(12) == before + 1);
 
-        // Device slot 75 (ID3D12Device9::CreateCommandQueue1) also wraps its queue.
+        // Device slots 74/75 are the console's page-pool pair (RegisterPagePoolX / UnregisterPagePoolX): answered by
+        // the proxy with a fresh index, never the PC device (whose slot 75 is CreateCommandQueue1).
         {
-            Ref<ID3D12Device9> device9;
-            if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device9.p)))) {
-                Ref<ID3D12CommandQueue> queue1;
-                const HRESULT hr = device9->CreateCommandQueue1(&direct_desc, __uuidof(ID3D12Device),
-                                                                IID_PPV_ARGS(&queue1.p));
-                EXPECT(xs::device_slot_hits(75) == 1);
-                EXPECT(SUCCEEDED(hr) && xs::is_queue_proxy(queue1.p));
-            } else {
-                std::printf("%s: no ID3D12Device9, CreateCommandQueue1 not checked\n", label);
-            }
+            std::uint32_t pool_index = 0xffffffffu;
+            EXPECT(SUCCEEDED(as_hr(raw_call(device, 74, 0x10000, 16,
+                                            reinterpret_cast<std::uint64_t>(&pool_index)))));
+            EXPECT(pool_index != 0xffffffffu);
+            EXPECT(xs::device_slot_hits(74) >= 1);
+            EXPECT(SUCCEEDED(as_hr(raw_call(device, 75, pool_index))));
+            EXPECT(xs::device_slot_hits(75) >= 1);
         }
 
-        // The refused tail: every slot from the end of the public chain to the end of the table.
-        for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
+        // The refused tail: the console methods the proxy answers end at 35 (ExecuteCommandListsX); 36 through the
+        // end of the table are refused.
+        for (unsigned slot = 36; slot < xs::queue_proxy_table_size(); ++slot) {
             before = qhits(slot);
             EXPECT(as_hr(call_slot(queue.p, slot)) == E_NOTIMPL);
             EXPECT(qhits(slot) == before + 1 && xs::queue_slot_first_call_seen(slot));
         }
-        for (unsigned slot = fence_slots; slot < xs::fence_proxy_table_size(); ++slot) {
+        // Fence slot 12 is the console's GetGpuAddress, so the refused range starts at 13.
+        for (unsigned slot = 13; slot < xs::fence_proxy_table_size(); ++slot) {
             before = fhits(slot);
             EXPECT(as_hr(call_slot(fence.p, slot)) == E_NOTIMPL);
             EXPECT(fhits(slot) == before + 1 && xs::fence_slot_first_call_seen(slot));
         }
         // The objects still work after refused calls.
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 10)));
-        if (wait_for(label, fence.p, 10)) return 1;
+        EXPECT(SUCCEEDED(queue_signal(queue.p, fence.p, 11)));
+        if (wait_for(label, fence.p, 11)) return 1;
         EXPECT(xs::command_object_proxy_ref_count(queue.p) == 1 && xs::command_object_proxy_ref_count(fence.p) == 1);
     }
     EXPECT(xs::device_proxy_ref_count(device) == device_refs);  // every queue and fence gave its reference back
@@ -437,17 +501,13 @@ int check_guard(const Backend& b) {
             EXPECT(probe.overruns() == before + 1);
         }
     }
-    EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
+    EXPECT(SUCCEEDED(queue_signal(queue.p, fence.p, 1)));
     if (wait_for(label, fence.p, 1)) return 1;
     std::printf("%s: a slot past either table faults in the guard region and is counted\n", label);
     return 0;
 }
 
 // ---- 3. Same HRESULT through the proxy as on the real object ----
-
-// What a case returns when the device lacks the interface the case needs. Not S_FALSE: CreateCommandQueue1 with a
-// null output returns S_FALSE for a valid description, so a proxy wrongly refusing ID3D12Device9 would match it.
-constexpr HRESULT kNoInterface = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
 
 struct DiffContext {
     ID3D12Device* device;      // proxy or real
@@ -512,15 +572,6 @@ HRESULT create_fence_as_queue(void* c) {
     if (SUCCEEDED(hr) && out) static_cast<IUnknown*>(out)->Release();
     return SUCCEEDED(hr) || out == nullptr ? hr : E_UNEXPECTED;
 }
-HRESULT create_queue1_no_output(void* c) {
-    ID3D12Device9* device9 = nullptr;
-    if (FAILED(static_cast<DiffContext*>(c)->device->QueryInterface(IID_PPV_ARGS(&device9)))) return kNoInterface;
-    D3D12_COMMAND_QUEUE_DESC desc{};
-    const HRESULT hr = device9->CreateCommandQueue1(&desc, __uuidof(ID3D12Device), __uuidof(ID3D12CommandQueue),
-                                                    nullptr);
-    device9->Release();
-    return hr;
-}
 HRESULT queue_get_device_wrong_iid(void* c) {
     void* out = reinterpret_cast<void*>(1);
     const HRESULT hr = static_cast<DiffContext*>(c)->queue->GetDevice(__uuidof(ID3D12Fence), &out);
@@ -561,11 +612,11 @@ HRESULT queue_private_data_size_query(void* c) {
     const HRESULT hr = queue->GetPrivateData(kDataKey, &size, nullptr);
     return SUCCEEDED(hr) && size != sizeof(value) ? E_UNEXPECTED : hr;
 }
-HRESULT queue_signal_null(void* c) { return static_cast<DiffContext*>(c)->queue->Signal(nullptr, 1); }
-HRESULT queue_wait_null(void* c) { return static_cast<DiffContext*>(c)->queue->Wait(nullptr, 1); }
-HRESULT queue_frequency_null(void* c) { return static_cast<DiffContext*>(c)->queue->GetTimestampFrequency(nullptr); }
+HRESULT queue_signal_null(void* c) { return queue_signal(static_cast<DiffContext*>(c)->queue, nullptr, 1); }
+HRESULT queue_wait_null(void* c) { return queue_wait(static_cast<DiffContext*>(c)->queue, nullptr, 1); }
+HRESULT queue_frequency_null(void* c) { return queue_frequency(static_cast<DiffContext*>(c)->queue, nullptr); }
 HRESULT queue_calibration_null(void* c) {
-    return static_cast<DiffContext*>(c)->queue->GetClockCalibration(nullptr, nullptr);
+    return queue_calibration(static_cast<DiffContext*>(c)->queue, nullptr, nullptr);
 }
 HRESULT fence_private_data_missing(void* c) {
     UINT size = 4;
@@ -574,39 +625,6 @@ HRESULT fence_private_data_missing(void* c) {
 }
 HRESULT fence_event_reached_null_handle(void* c) {
     return static_cast<DiffContext*>(c)->fence->SetEventOnCompletion(0, nullptr);  // reached: returns at once
-}
-HRESULT multiple_fences_count0(void* c) {
-    auto* d = static_cast<DiffContext*>(c);
-    ID3D12Device1* device1 = nullptr;
-    if (FAILED(d->device->QueryInterface(IID_PPV_ARGS(&device1)))) return kNoInterface;
-    ID3D12Fence* both[] = {d->fence, d->second};
-    const UINT64 values[] = {0, 0};
-    const HRESULT hr = device1->SetEventOnMultipleFenceCompletion(both, values, 0, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL,
-                                                                  d->event);
-    device1->Release();
-    return hr;
-}
-HRESULT multiple_fences_bad_flags(void* c) {
-    auto* d = static_cast<DiffContext*>(c);
-    ID3D12Device1* device1 = nullptr;
-    if (FAILED(d->device->QueryInterface(IID_PPV_ARGS(&device1)))) return kNoInterface;
-    ID3D12Fence* both[] = {d->fence, d->second};
-    const UINT64 values[] = {0, 0};
-    const HRESULT hr = device1->SetEventOnMultipleFenceCompletion(
-        both, values, 2, static_cast<D3D12_MULTIPLE_FENCE_WAIT_FLAGS>(7), d->event);
-    device1->Release();
-    return hr;
-}
-HRESULT multiple_fences_null_entry(void* c) {
-    auto* d = static_cast<DiffContext*>(c);
-    ID3D12Device1* device1 = nullptr;
-    if (FAILED(d->device->QueryInterface(IID_PPV_ARGS(&device1)))) return kNoInterface;
-    ID3D12Fence* both[] = {d->fence, nullptr};
-    const UINT64 values[] = {0, 0};
-    const HRESULT hr = device1->SetEventOnMultipleFenceCompletion(both, values, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL,
-                                                                  d->event);
-    device1->Release();
-    return hr;
 }
 HRESULT make_resident_fence_and_queue(void* c) {
     auto* d = static_cast<DiffContext*>(c);
@@ -618,31 +636,6 @@ HRESULT evict_fence_and_queue(void* c) {
     ID3D12Pageable* objects[] = {d->fence, d->queue};
     const HRESULT hr = d->device->Evict(2, objects);
     d->device->MakeResident(2, objects);
-    return hr;
-}
-HRESULT residency_priority(void* c) {
-    auto* d = static_cast<DiffContext*>(c);
-    ID3D12Device1* device1 = nullptr;
-    if (FAILED(d->device->QueryInterface(IID_PPV_ARGS(&device1)))) return kNoInterface;
-    ID3D12Pageable* objects[] = {d->fence, d->queue};
-    const D3D12_RESIDENCY_PRIORITY priorities[] = {D3D12_RESIDENCY_PRIORITY_NORMAL, D3D12_RESIDENCY_PRIORITY_HIGH};
-    const HRESULT hr = device1->SetResidencyPriority(2, objects, priorities);
-    device1->Release();
-    return hr;
-}
-HRESULT enqueue_make_resident(void* c) {
-    auto* d = static_cast<DiffContext*>(c);
-    ID3D12Device3* device3 = nullptr;
-    if (FAILED(d->device->QueryInterface(IID_PPV_ARGS(&device3)))) return kNoInterface;
-    ID3D12Pageable* objects[] = {d->fence, d->queue};
-    const UINT64 target = d->second->GetCompletedValue() + 1;
-    HRESULT hr = device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 2, objects, d->second, target);
-    device3->Release();
-    if (SUCCEEDED(hr)) {  // the fence must reach the value (the call signals it when the objects are resident)
-        if (FAILED(d->second->SetEventOnCompletion(target, d->event)) ||
-            WaitForSingleObject(d->event, 5000) != WAIT_OBJECT_0)
-            return E_UNEXPECTED;
-    }
     return hr;
 }
 HRESULT shared_handle_unshared_fence(void* c) {
@@ -688,7 +681,6 @@ const DiffCase kDiffCases[] = {
     {"CreateFence, no output", &create_fence_no_output},
     {"CreateFence, flags 0x80", &create_fence_bad_flags},
     {"CreateFence as IID_ID3D12CommandQueue", &create_fence_as_queue},
-    {"CreateCommandQueue1, no output", &create_queue1_no_output},
     {"queue GetDevice as IID_ID3D12Fence", &queue_get_device_wrong_iid},
     {"queue GetDevice, no output", &queue_get_device_no_output},
     {"queue QueryInterface, no output", &queue_query_no_output},
@@ -702,13 +694,8 @@ const DiffCase kDiffCases[] = {
     {"queue GetClockCalibration(null, null)", &queue_calibration_null},
     {"fence GetPrivateData, missing key", &fence_private_data_missing},
     {"fence SetEventOnCompletion(reached, null)", &fence_event_reached_null_handle},
-    {"SetEventOnMultipleFenceCompletion, count 0", &multiple_fences_count0},
-    {"SetEventOnMultipleFenceCompletion, flags 7", &multiple_fences_bad_flags},
-    {"SetEventOnMultipleFenceCompletion, null entry", &multiple_fences_null_entry},
     {"MakeResident(fence, queue)", &make_resident_fence_and_queue},
     {"Evict(fence, queue)", &evict_fence_and_queue},
-    {"SetResidencyPriority(fence, queue)", &residency_priority},
-    {"EnqueueMakeResident(fence, queue) -> second fence", &enqueue_make_resident},
     {"CreateSharedHandle(unshared fence)", &shared_handle_unshared_fence},
     {"CreateSharedHandle(queue)", &shared_handle_queue},
 };
@@ -1254,9 +1241,6 @@ int check_identity(const Backend& b) {
                               reinterpret_cast<std::uint64_t>(&out))) == E_POINTER);
         EXPECT(as_hr(raw_call(device, 36, 0, 0, 0, reinterpret_cast<std::uint64_t>(&out))) == E_POINTER);
         EXPECT(as_hr(raw_call(device, 32, 0, 0, reinterpret_cast<std::uint64_t>(&out))) == E_POINTER);
-        if (xs::device_proxy_slot_count(device) > 75)
-            EXPECT(as_hr(raw_call(device, 75, reinterpret_cast<std::uint64_t>(&desc0), 0, 0,
-                                  reinterpret_cast<std::uint64_t>(&out))) == E_POINTER);
         out = reinterpret_cast<void*>(1);
         EXPECT(as_hr(raw_call(typed.p, 0, 0, reinterpret_cast<std::uint64_t>(&out))) == E_POINTER && !out);
         EXPECT(as_hr(raw_call(typed.p, 7, 0, reinterpret_cast<std::uint64_t>(&out))) == E_POINTER);
@@ -1422,11 +1406,7 @@ int check_xbox_client(const Backend& b) {
     EXPECT(SUCCEEDED(as_hr(raw(device, 34, 4, word(pageables)))));
     EXPECT(SUCCEEDED(as_hr(raw(device, 35, 4, word(pageables)))));
     EXPECT(SUCCEEDED(as_hr(raw(device, 34, 4, word(pageables)))));
-    ID3D12Pageable* resources[] = {gpu.p};
-    const D3D12_RESIDENCY_PRIORITY priority[] = {D3D12_RESIDENCY_PRIORITY_HIGH};
-    EXPECT(SUCCEEDED(as_hr(raw(device, 46, 1, word(resources), word(priority)))));
-
-    // The copies: upload -> GPU buffer -> readback, executed through queue slot 10 and finished through slot 14
+    // The copies: upload -> GPU buffer -> readback, executed through queue slot 10 and finished through slot 16
     // and fence slot 9.
     Ref<ID3D12CommandAllocator> allocator;
     Ref<ID3D12GraphicsCommandList> list;
@@ -1445,7 +1425,7 @@ int check_xbox_client(const Backend& b) {
     EXPECT(SUCCEEDED(list->Close()));
     ID3D12CommandList* lists[] = {list.p};
     raw(queue.p, 10, 1, word(lists));
-    EXPECT(SUCCEEDED(as_hr(raw(queue.p, 14, word(fence.p), 1))));
+    EXPECT(SUCCEEDED(as_hr(raw(queue.p, 16, word(fence.p), 1))));
     Event done;
     EXPECT(SUCCEEDED(as_hr(raw(fence.p, 9, 1, word(done.h)))) && done.set_within(5000));
     EXPECT(raw(fence.p, 8) >= 1);
@@ -1460,21 +1440,14 @@ int check_xbox_client(const Backend& b) {
         EXPECT(same);  // the GPU really ran the list the queue proxy submitted
     }
 
-    // Device slot 50: EnqueueMakeResident with the objects and a fence proxy to signal.
-    EXPECT(SUCCEEDED(as_hr(raw(device, 50, D3D12_RESIDENCY_FLAG_NONE, 4, word(pageables), word(fence.p), 2))));
-    EXPECT(SUCCEEDED(as_hr(raw(fence.p, 9, 2, word(done.h)))) && done.set_within(5000));
-
-    // Queue slot 15 holds the queue until the CPU (fence slot 10) signals; device slot 45 then sees both fences.
-    EXPECT(SUCCEEDED(as_hr(raw(queue.p, 15, word(fence.p), 3))));
-    EXPECT(SUCCEEDED(as_hr(raw(queue.p, 14, word(second.p), 1))));
+    // Queue slot 17 (Wait) holds the queue until the CPU (fence slot 10) signals. The console device has no
+    // SetEventOnMultipleFenceCompletion, so each fence is waited on directly.
+    EXPECT(SUCCEEDED(as_hr(raw(queue.p, 17, word(fence.p), 3))));
+    EXPECT(SUCCEEDED(as_hr(raw(queue.p, 16, word(second.p), 1))));
     Sleep(50);
     EXPECT(raw(second.p, 8) == 0);
     EXPECT(SUCCEEDED(as_hr(raw(fence.p, 10, 3))));
-    ID3D12Fence* both[] = {fence.p, second.p};
-    const UINT64 values[] = {3, 1};
-    EXPECT(SUCCEEDED(as_hr(raw(device, 45, word(both), word(values), 2, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL,
-                               word(done.h)))) &&
-           done.set_within(5000));
+    EXPECT(SUCCEEDED(as_hr(raw(second.p, 9, 1, word(done.h)))) && done.set_within(5000));
     EXPECT(raw(second.p, 8) == 1);
 
     // Release the way such a client does: through slot 2, the queue and fences before the resources.
@@ -1505,7 +1478,7 @@ int check_coverage(const Backend& b) {
     // Slots an earlier check skips on purpose on this backend (and says so) are not asked for: 75 without
     // ID3D12Device9, queue 8/9 without reserved resources, 31 without shared fences, 32 when they cannot be opened.
     const bool device9 = xs::device_proxy_slot_count(b.device) > 75;
-    for (unsigned slot : {8u, 34u, 35u, 36u, 45u, 46u, 50u}) need("device", slot, xs::device_slot_hits(slot));
+    for (unsigned slot : {8u, 34u, 35u, 36u}) need("device", slot, xs::device_slot_hits(slot));
     if (device9) need("device", 75, xs::device_slot_hits(75));
     if (g_shared_created) need("device", 31, xs::device_slot_hits(31));
     if (g_shared_checked) need("device", 32, xs::device_slot_hits(32));
@@ -1516,7 +1489,7 @@ int check_coverage(const Backend& b) {
     for (unsigned slot = 0; slot < xs::fence_proxy_table_size(); ++slot) need("fence", slot, xs::fence_slot_hits(slot));
     EXPECT(missing == 0);
     EXPECT(xs::queue_table_overruns() >= 3 && xs::fence_table_overruns() >= 3);
-    std::printf("%s: coverage: device slots 8/34/35/36/45/46/50%s%s%s, %s %u queue and all %u fence slots, both "
+    std::printf("%s: coverage: device slots 8/34/35/36%s%s%s, %s %u queue and all %u fence slots, both "
                 "guard regions\n", label, device9 ? "/75" : "", g_shared_created ? "/31" : "",
                 g_shared_checked ? "/32" : "", g_reserved_checked ? "all" : "all but 8/9 of the",
                 xs::queue_proxy_table_size(), xs::fence_proxy_table_size());
@@ -1572,10 +1545,10 @@ int check_threads(const Backend& b) {
                 FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&mark))))
                 fail(__LINE__);
             for (UINT64 v = 1; event && queue && fence && mark && v <= kSignals; ++v) {
-                if (FAILED(queue->Signal(fence, v)) || FAILED(fence->SetEventOnCompletion(v, event)) ||
+                if (FAILED(queue_signal(queue, fence, v)) || FAILED(fence->SetEventOnCompletion(v, event)) ||
                     WaitForSingleObject(event, 5000) != WAIT_OBJECT_0)
                     fail(__LINE__);
-                if (FAILED(shared_queue->Signal(mark, v))) fail(__LINE__);  // one queue, many threads
+                if (FAILED(queue_signal(shared_queue.p, mark, v))) fail(__LINE__);  // one queue, many threads
             }
             // The shared queue's signals land in order: the last one means all of this thread's have.
             if (event && mark && (FAILED(mark->SetEventOnCompletion(kSignals, event)) ||
@@ -1592,7 +1565,7 @@ int check_threads(const Backend& b) {
     // The shared queue's last Signals must also have landed.
     Ref<ID3D12Fence> tail;
     EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&tail.p))));
-    EXPECT(SUCCEEDED(shared_queue->Signal(tail.p, 1)));
+    EXPECT(SUCCEEDED(queue_signal(shared_queue.p, tail.p, 1)));
     if (wait_for(label, tail.p, 1)) return 1;
     tail.reset();
     EXPECT(xs::command_object_proxy_ref_count(shared_queue.p) == 1);
@@ -1620,14 +1593,14 @@ int one_round(const char* label, ID3D12Device* real, bool vulkan, bool children_
     for (int i = 0; i < 3; ++i) {
         EXPECT(SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queues[i]))));
         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fences[i]))));
-        EXPECT(SUCCEEDED(queues[i]->Signal(fences[i], 1)));
+        EXPECT(SUCCEEDED(queue_signal(queues[i], fences[i], 1)));
     }
     for (int i = 0; i < 3; ++i)
         if (wait_for(label, fences[i], 1)) return 1;
     if (children_last) {
         // Release the title's device reference first: the children keep the proxy alive and still work.
         device->Release();
-        EXPECT(SUCCEEDED(queues[0]->Signal(fences[1], 2)));
+        EXPECT(SUCCEEDED(queue_signal(queues[0], fences[1], 2)));
         if (wait_for(label, fences[1], 2)) return 1;
         ID3D12Device* owner = nullptr;
         EXPECT(SUCCEEDED(fences[2]->GetDevice(IID_PPV_ARGS(&owner))) && owner == device);

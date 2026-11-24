@@ -474,6 +474,10 @@ if(BUILD_TESTING)
   add_executable(gfx10_tiling_test test/gfx10_tiling_test.cpp)
   add_test(NAME gfx10_tiling COMMAND gfx10_tiling_test)
 
+  # The console's GFX10 texture layout model (src/console_texture_layout.h): pure stdlib, no GPU or game files.
+  add_executable(console_texture_layout_test test/console_texture_layout_test.cpp)
+  add_test(NAME console_texture_layout COMMAND console_texture_layout_test)
+
   add_executable(retire_tickets_test test/retire_tickets_test.cpp)
   add_test(NAME retire_tickets COMMAND retire_tickets_test)
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.

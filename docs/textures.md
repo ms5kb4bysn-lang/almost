@@ -229,6 +229,14 @@ volumes) are validated with 0 mismatches in `docs/textures_arrays.md`, leaving o
 `tools/ttpf_mips.py` uses those functions for `scan`, `layout`, `check` and `export`, so the
 measurement and the proposed reader rule cannot drift apart.
 
+The runtime carries the same rule in C++: `runtime/src/console_texture_layout.h` computes the console's
+allocation size, alignment, swizzle mode and per-subresource offsets, and
+`runtime/test/console_texture_layout_test.cpp` pins the published console number (512x512 BC7, 10 mips:
+0x56000 bytes, 4 KiB aligned) plus the mode picks and the descriptions the model refuses. Xbox device slot 25
+(`GetResourceAllocationInfo`) answers with these numbers only where the real device accepts the description:
+the PC answer is the capability check, so a format/flag combination it cannot create still comes back
+`UINT64_MAX`.
+
 The rule is only claimed for 2D descriptors with a 1/2/4/8/16-byte element. The 12-byte DXGI
 formats 6/7/8 do not occur in the measured 2D set, so `compact_surface_layout` rejects them
 rather than guessing a Gfx10 log pattern. 2D uncompressed tiling is validated across all

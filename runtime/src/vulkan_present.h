@@ -666,7 +666,6 @@ private:
     // it succeeds the presenter keeps the vkd3d "render to nothing" behaviour, not a sticky failure.
     void mark_surface_lost() {
         auto& vk = context_.vk;
-        const VkDevice device = context_.device();
         {
             std::lock_guard lock(context_.submit_mutex());
             vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use

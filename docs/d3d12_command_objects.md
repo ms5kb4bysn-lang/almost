@@ -159,6 +159,33 @@ eight slots and `ID3D12Pageable` adds none.
 | 17 | `0x088` | `GetClockCalibration` | `d3d12.h:8751` |
 | 18 | `0x090` | `GetDesc` (returns the 16-byte desc by value on MSVC) | `d3d12.h:8756` |
 
+#### The console's newer queue layout (what `game_scarlett_master.exe` 1.0.2.1 calls)
+
+The table above is the PC order. The console runtime the game was built against inserts two methods at
+14/15 and moves the PC methods after them; the proxy follows that layout and never forwards 14–20 as PC
+slots (forwarding 16 used to write a timestamp frequency through a fence proxy's vtable). Sources: facts
+only from Marvisak/VIctory `queue.rs` (GPL-3.0) and xcl-dev/xcl `queue_dispatch` (GPL-2.0-only), plus the
+game's call sites through the queue global at `0x148759ff8`:
+
+| Console slot | Method | Call site / evidence |
+|---:|---|---|
+| 14, 15 | console methods, not named by any source | — |
+| 16 | `Signal(fence, value)` | VIctory 0x80; XCL |
+| 17 | `Wait(fence, value)` | VIctory; XCL |
+| 18 | `GetTimestampFrequency(u64*)` | game at `0x1424841a6` (8-byte stack slot) |
+| 19 | `GetClockCalibration(gpu*, cpu*)` | XCL |
+| 20 or 28 | `GetDesc` (sources disagree; the proxy answers both) | VIctory 20, XCL 28 |
+| 23, 24 | suspend / resume | game at `0x14249009f`, `0x1424900b4` |
+| 25 | `SignalX(fence, value, flags)` | XCL (older 23) |
+| 31 | `CopyPageMappingsBatchX` (texture streaming) | VIctory |
+| 32 | `PresentX(plane count, planes, params)` | game at `0x14248b68a`, `0x14248d847` |
+| 34 | `Signal` with top/bottom sync settings | VIctory (older 32) |
+| 35 | `ExecuteCommandListsX(count, lists, token, flags)` | game at `0x1424821dd`; VIctory |
+
+Fence slot 12 is the console's `GetGpuAddress()`, the address of the completed value; the proxy returns a
+64-byte cell kept current by a watcher thread, because the title sleeps on it with `monitorx`/`mwaitx`
+(VIctory `fence.rs`, XCL `fence_x.rs`).
+
 `ID3D12CommandAllocator` is declared at `d3d12.h:5193`; it has 9 slots (0–8), with
 `Reset` at slot 8 (`d3d12.h:5196`).
 

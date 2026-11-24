@@ -587,6 +587,9 @@ enum class IndirectKind : std::uint8_t {
     draw = 0,
     draw_indexed = 1,
     dispatch = 2,
+    // A console DISPATCH_MESH signature: accepted at creation so the title's signature exists; the replay refuses
+    // it at execution until a mesh-indirect path lands.
+    dispatch_mesh = 3,
 };
 
 struct ExecuteIndirect {
