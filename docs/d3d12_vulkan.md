@@ -2945,9 +2945,10 @@ queue they came on (one `VkQueue` behind all of them).
 
 - *Frame pacing* (`FramePacer`, time from an injectable clock; real time is a steady timer, a host vblank source
   can replace it). `SetFrameIntervalX` takes the interval as a period in microseconds and the latency, and starts
-  the vblank grid. `ScheduleFrameEventX` arms the origin event, delayed by an offset inside the frame.
-  `WaitFrameEventX` returns at the next origin with the next token (1, 2, 3, ...; 0 is the null token) and does not
-  return while `latency` presented frames are still waiting for their vblank. A frame presented before the origin event
+  the vblank grid. `ScheduleFrameEventX` arms one of the three frame-event types (0 the origin, 1 and 2 later
+  points of the frame; public XCL's `frame.rs`), each with its own offset inside the frame. `WaitFrameEventX` returns
+  at the next occurrence of that type; only the origin hands out a token (1, 2, 3, ...; 0 is the null token), and an
+  origin wait does not return while `latency` presented frames are still waiting for their vblank. A frame presented before the origin event
   is armed is not paced (`PresentX` does not hold it for a vblank), so it is shown at once and never waits for a vblank:
   blank presents of a loading screen do not delay the first wait. A wait that comes late returns at once
   with the newest passed origin; the missed ones are skipped. A finite timeout gives

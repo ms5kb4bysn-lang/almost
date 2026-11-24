@@ -1,5 +1,6 @@
-// FramePacer (src/frame_pacer.h) on a fake clock: the interval, the origin event with an offset, late waits, timeouts,
-// the latency limit, tokens and their validation, statistics, and suspend/resume with re-registration. No GPU.
+// FramePacer (src/frame_pacer.h) on a fake clock: the interval, the three frame-event types with their offsets, late
+// waits, timeouts, the latency limit, tokens and their validation, statistics, and suspend/resume with re-registration.
+// No GPU.
 #include "../src/frame_pacer.h"
 
 #include <chrono>
@@ -58,6 +59,7 @@ int main() {
         EXPECT(pacer.schedule_frame_event(7, 0, 0) == pacer_hr::invalid_arg);                         // unknown event
         EXPECT(pacer.schedule_frame_event(frame_event_origin, period, 0) == pacer_hr::invalid_arg);   // offset >= period
         EXPECT(pacer.schedule_frame_event(frame_event_origin, 0, 0) == pacer_hr::ok);
+        EXPECT(pacer.wait_frame_event(1, 0, 0, &token) == pacer_hr::invalid_state);  // not scheduled
         EXPECT(pacer.wait_frame_event(3, 0, 0, &token) == pacer_hr::invalid_arg);
         EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, nullptr) == pacer_hr::invalid_arg);
         EXPECT(pacer.registered());
@@ -102,6 +104,40 @@ int main() {
         FrameStatistic stat;
         EXPECT(pacer.get_frame_statistics(1, stat_frame_event, &count, &stat) == pacer_hr::ok);
         EXPECT(count == 1 && stat.type == stat_frame_event && stat.time_us == period + 5000);
+    }
+
+    // Types 1 and 2 are later points of the frame: their own offsets, no pipeline token, independent waits. A title
+    // that schedules the origin and type 2 both at offset 0 gets both at the same vblank (public XCL facts).
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 1));
+        EXPECT(pacer.schedule_frame_event(1, 5000, 0) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(2, 0, 0) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(3, 0, 0) == pacer_hr::invalid_arg);
+        auto type2 = std::async(std::launch::async, [&pacer] {
+            Result r{0, 99};
+            r.hr = pacer.wait_frame_event(2, infinite_timeout_ms, 0, &r.token);
+            return r;
+        });
+        EXPECT(blocked(type2));
+        clock.advance_us(period);
+        const Result r2 = type2.get();
+        EXPECT(r2.hr == pacer_hr::ok && r2.token == 99);  // untouched: only the origin hands out tokens
+        EXPECT(pacer.tokens_issued() == 0);
+        auto type1 = std::async(std::launch::async, [&pacer] {
+            Result r{0, 0};
+            r.hr = pacer.wait_frame_event(1, infinite_timeout_ms, 0, &r.token);
+            return r;
+        });
+        EXPECT(blocked(type1));
+        clock.advance_us(4999);
+        EXPECT(blocked(type1));
+        clock.advance_us(1);
+        EXPECT(type1.get().hr == pacer_hr::ok);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == 1);
+        EXPECT(pacer.tokens_issued() == 1);
     }
 
     // Scheduling later than the interval was set makes the next vblank the first origin, not the missed ones.
