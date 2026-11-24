@@ -1317,6 +1317,42 @@ HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out) {
     return S_OK;
 }
 
+// The console's list table is not the PC's. From VIctory's list.rs (METHODS, newer_slot; facts only): the base console
+// layout keeps the PC order up to slot 27, then moves the query methods ahead of the root-signature group:
+//   console 28-31 = PC 52-55 (BeginQuery, EndQuery, ResolveQueryData, SetPredication), 32-50 = PC 28-46
+//   (SetDescriptorHeaps .. OMSetRenderTargets), 51-54 = PC 47-50 (the clears), 55 = PC 51 (DiscardResource),
+//   56-58 = PC 56-58 (markers), 59 = PC 59 (ExecuteIndirect); later console slots are mostly console-only, and
+//   127 is DispatchMesh (PC 79).
+// Slots 31 and 53-55 are inferred from the gaps (VIctory names their neighbours). game_scarlett_master.exe 1.0.2.1 uses
+// the newer layout, with two more methods at 59/60, so its slot s >= 61 is base slot s - 2 (VIctory: ExecuteIndirect
+// at 0x1e8, syncs at 0x418/0x420 = 131/132, ResetX at 0x458 = 139); it called 131 and 132 at boot.
+constexpr int kListConsoleOnly = -1;
+
+constexpr int list_pc_slot(unsigned console) {
+    if (console < 59) {
+        if (console <= 27) return static_cast<int>(console);
+        if (console <= 31) return static_cast<int>(console) + 24;  // 28-31 -> 52-55
+        if (console <= 50) return static_cast<int>(console) - 4;   // 32-50 -> 28-46
+        if (console <= 54) return static_cast<int>(console) - 4;   // 51-54 -> 47-50
+        if (console == 55) return 51;
+        return static_cast<int>(console);                          // 56-58
+    }
+    if (console == 59 || console == 60) return kListConsoleOnly;   // the newer layout's two additions
+    const unsigned base = console - 2;
+    if (base == 59) return 59;                                     // ExecuteIndirect
+    if (base == 127) return 79;                                    // DispatchMesh
+    return kListConsoleOnly;
+}
+static_assert(list_pc_slot(28) == 52 && list_pc_slot(32) == 28 && list_pc_slot(50) == 46 && list_pc_slot(51) == 47 &&
+              list_pc_slot(61) == 59 && list_pc_slot(129) == 79 && list_pc_slot(131) == kListConsoleOnly);
+
+// Console-only list methods with a known shape (newer layout slots).
+constexpr unsigned kListSyncTop = 131, kListSyncBottom = 132;  // (flags, control, address, size): no PC equivalent
+constexpr unsigned kListResetX = 139;                          // (allocator, pipeline, flags): Reset; the title asserts
+constexpr unsigned kListStateFlush = 142;                      // (u64), result unused by the title's state flush
+constexpr unsigned kListBarrierGroups = 146;                   // enhanced barriers (group count, groups)
+constexpr unsigned kListAllocateUpload = 148;                  // (size, alignment) -> pointer, null on failure
+
 template <unsigned Slot>
 std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1337,33 +1373,50 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                                reinterpret_cast<void**>(a2)));
     } else {
         note_list_slot(Slot);
-        if (Slot >= self->slot_count) {
-            static std::atomic<bool> warned{false};
-            if (first_call(warned))
-                std::fprintf(stderr,
-                             "[rt] d3d12_xs: list slot %u is beyond the PC list vtable (%u slots); returning "
-                             "E_NOTIMPL (args 0x%llx 0x%llx 0x%llx 0x%llx)\n",
-                             Slot, self->slot_count, static_cast<unsigned long long>(a1),
-                             static_cast<unsigned long long>(a2), static_cast<unsigned long long>(a3),
-                             static_cast<unsigned long long>(a4));
-            return hr_to_u64(E_NOTIMPL);
-        }
         using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t, std::uint64_t);
-        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
-        // The three list methods that take objects this proxy wraps: Reset(allocator, state), ExecuteBundle(list)
-        // and SetDescriptorHeaps(count, heaps).
-        if constexpr (Slot == 10 || Slot == 27) {
-            a1 = unwrap_object(a1);
-        } else if constexpr (Slot == 28) {
-            UnwrappedArray heaps;
-            if (!heaps.fill(a2, a1)) return 0;
-            const std::uint64_t unwrapped = heaps.data() ? heaps.data() : a2;
-            return fn(self->real, a1, unwrapped, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+        if constexpr (Slot == kListSyncTop || Slot == kListSyncBottom || Slot == kListStateFlush) {
+            return 0;  // no PC counterpart; the PC driver orders the work itself
+        } else if constexpr (Slot == kListResetX) {
+            if (self->slot_count <= 10) return hr_to_u64(E_NOTIMPL);
+            return reinterpret_cast<ForwardFn>(self->real_vtable[10])(self->real, unwrap_object(a1), a2, 0, 0, 0, 0,
+                                                                      0, 0, 0, 0, 0, 0, 0, 0);
+        } else {
+            constexpr int pc = list_pc_slot(Slot);
+            // Logged once per slot with its arguments; 0, not E_NOTIMPL, because a method that returns a pointer
+            // (148, the upload allocator) had its result written through (VIctory).
+            const auto refuse = [&](const char* why) -> std::uint64_t {
+                static std::atomic<bool> warned{false};
+                if (first_call(warned))
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: list slot %u (%s) is not implemented; returning 0 (args 0x%llx 0x%llx "
+                                 "0x%llx 0x%llx)\n",
+                                 Slot, why, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                                 static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+                return 0;
+            };
+            if constexpr (pc == kListConsoleOnly) {
+                return refuse(Slot == kListBarrierGroups    ? "barrier groups"
+                              : Slot == kListAllocateUpload ? "upload allocation"
+                                                            : "console-only");
+            } else {
+                if (static_cast<unsigned>(pc) >= self->slot_count) return refuse("past the PC list");
+                auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[pc]);
+                // The three PC list methods that take objects this proxy wraps: Reset(allocator, state),
+                // ExecuteBundle(list) and SetDescriptorHeaps(count, heaps).
+                if constexpr (pc == 10 || pc == 27) {
+                    a1 = unwrap_object(a1);
+                } else if constexpr (pc == 28) {
+                    UnwrappedArray heaps;
+                    if (!heaps.fill(a2, a1)) return 0;
+                    const std::uint64_t unwrapped = heaps.data() ? heaps.data() : a2;
+                    return fn(self->real, a1, unwrapped, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+                }
+                return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+            }
         }
-        return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
     }
 }
 
