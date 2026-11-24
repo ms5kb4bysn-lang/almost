@@ -9243,6 +9243,12 @@ BOOL CALLBACK find_process_window(HWND window, LPARAM param) {
     if (!search.first) search.first = window;
     RECT rect{};
     if (!GetWindowRect(window, &rect)) return TRUE;
+    wchar_t title[128]{}, cls[64]{};
+    GetWindowTextW(window, title, static_cast<int>(std::size(title)));
+    GetClassNameW(window, cls, static_cast<int>(std::size(cls)));
+    std::fprintf(stderr, "[rt] present: candidate window %p %ldx%ld class \"%ls\" title \"%ls\"\n",
+                 static_cast<void*>(window), static_cast<long>(rect.right - rect.left),
+                 static_cast<long>(rect.bottom - rect.top), cls, title);
     const LONG area = (rect.right - rect.left) * (rect.bottom - rect.top);
     if (!search.largest || area > search.largest_area) {
         search.largest = window;
@@ -9265,9 +9271,26 @@ XboxPresentationEntry* xbox_presentation_for(ID3D12Device* real, bool create, bo
     if (found != presentations.by_device.end()) return &found->second;
     if (!create) return nullptr;
     if (!Device::from<Device>(real)) return nullptr;
+    // LEONIDA_PRESENT_HWND=<hex or decimal HWND>: present into this window instead of the largest one of the
+    // process. Useful when a splash/loading window is the largest at the moment the first frame event arrives.
+    HWND window = nullptr;
+    wchar_t wanted[64]{};
+    const DWORD wanted_length = GetEnvironmentVariableW(L"LEONIDA_PRESENT_HWND", wanted, static_cast<DWORD>(std::size(wanted)));
+    if (wanted_length > 0 && wanted_length < std::size(wanted)) {
+        wchar_t* end = nullptr;
+        const unsigned long long value = std::wcstoull(wanted, &end, 0);
+        if (end != wanted && value && IsWindow(reinterpret_cast<HWND>(static_cast<std::uintptr_t>(value)))) {
+            window = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(value));
+            std::fprintf(stderr, "[rt] present: LEONIDA_PRESENT_HWND selects window %p\n", static_cast<void*>(window));
+        } else {
+            std::fprintf(stderr, "[rt] present: LEONIDA_PRESENT_HWND=%ls is not a live window; searching\n", wanted);
+        }
+    }
     MainWindowSearch search;
-    EnumWindows(&find_process_window, reinterpret_cast<LPARAM>(&search));
-    HWND window = search.largest ? search.largest : search.first;
+    if (!window) {
+        EnumWindows(&find_process_window, reinterpret_cast<LPARAM>(&search));
+        window = search.largest ? search.largest : search.first;
+    }
     if (!window) {
         static std::atomic<bool> said{false};
         if (!said.exchange(true))
