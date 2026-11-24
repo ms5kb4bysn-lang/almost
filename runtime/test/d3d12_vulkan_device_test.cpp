@@ -2,10 +2,13 @@
 // the proxy the way the game will call it: device methods (forwarded slots), descriptor heaps from slot 14 with
 // start handles read in the Xbox shape (RAX), a texture from slot 76 with the Xbox layout word, committed
 // resources, views, command lists, a queue, a fence and query heaps. Results are read back through D3D12 itself
-// (CopyTextureRegion into a readback heap, then Map). GetCopyableFootprints, GetResourceAllocationInfo,
-// GetResourceTiling, copies (d3d12_copy_compare.h), CheckFeatureSupport's error paths, fence semantics and the
-// HRESULTs of invalid arguments to resource, heap, queue and fence creation and Map are compared with the host PC
-// runtime's
+// (CopyTextureRegion into a readback heap, then Map). Queue methods use the console layout the proxy presents
+// (Signal/Wait at 16/17, the timestamps at 18/19, GetDesc at 20), through d3d12_queue_layout.h. The console device
+// table shares the PC's slots only up to 43, so the PC-only error paths and the ID3D12Device1..6 checks run on the
+// layer's PC device (`inner`), which the proxy wraps, with a printf saying so. GetCopyableFootprints,
+// GetResourceAllocationInfo, GetResourceTiling, copies (d3d12_copy_compare.h), CheckFeatureSupport's error paths,
+// fence semantics and the HRESULTs of invalid arguments to resource, heap, queue and fence creation and Map are
+// compared with the host PC runtime's
 // (LEONIDA_D3D49_VERBOSE=1 prints every argument case). WriteToSubresource/ReadFromSubresource run on
 // devices of their own, once per copy path. No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run
 // under VK_LAYER_KHRONOS_validation; any validation error fails the test.
@@ -15,6 +18,7 @@
 #include "../shims/d3d12_xs_device.h"
 #include "d3d12_copy_compare.h"  // D3D-46: copies compared with the host runtime
 #include "d3d12_depth24_compare.h"  // D24 clears compared with the host runtime
+#include "d3d12_queue_layout.h"  // queue methods through a real queue or the Xbox-ABI queue proxy
 #include "../src/vulkan_memory.h"  // D3D-96: resizable_bar
 
 #include <dxgi1_4.h>
@@ -1094,14 +1098,14 @@ std::vector<Rule> command_list_rules(ID3D12Device* device) {
     // In flight: the queue first waits for `gate`, which only the CPU signals, after the checks below.
     add("Reset", list->Reset(alloc.p, nullptr));
     add("Close", list->Close());
-    add("queue Wait", queue->Wait(gate.p, 1));
+    add("queue Wait", queuelayout::queue_wait(queue.p, gate.p, 1));
     ID3D12CommandList* lists[] = {list.p};
     queue->ExecuteCommandLists(1, lists);
     add("allocator Reset while its list is in flight", alloc->Reset());
     add("Reset the in-flight list onto another allocator", list->Reset(other.p, nullptr));
     add("Close", list->Close());
     add("fence Signal from the CPU", gate->Signal(1));
-    add("queue Signal", queue->Signal(done.p, 1));
+    add("queue Signal", queuelayout::queue_signal(queue.p, done.p, 1));
     add("SetEventOnCompletion (blocking)", done->SetEventOnCompletion(1, nullptr));
     add("allocator Reset after the GPU finished", alloc->Reset());
 
@@ -1423,7 +1427,8 @@ bool capture_resolve(ID3D12Device* device, DXGI_FORMAT format, UINT samples, Res
     queue->ExecuteCommandLists(1, lists);
     if (proxy)
         RESOLVE_CHECK(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-    RESOLVE_CHECK(SUCCEEDED(queue->Signal(fence.p, 1)) && SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
+    RESOLVE_CHECK(SUCCEEDED(queuelayout::queue_signal(queue.p, fence.p, 1)) &&
+                  SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
 
     D3D12_RANGE read_range{0, SIZE_T(cursor)};
     std::uint8_t* mapped = nullptr;
@@ -5019,11 +5024,11 @@ int compare_fences(ID3D12Device* ours) {
                          static_cast<unsigned>(b));
     };
     // A signal raises the completed value; a null event blocks until it is reached.
-    check_hr("signal 5", oq->Signal(of.p, 5), hq->Signal(hf.p, 5));
+    check_hr("signal 5", queuelayout::queue_signal(oq.p, of.p, 5), hq->Signal(hf.p, 5));
     check_hr("block to 5", of->SetEventOnCompletion(5, nullptr), hf->SetEventOnCompletion(5, nullptr));
     check("completed at 5", of->GetCompletedValue(), hf->GetCompletedValue());
     // A higher signal raises it again.
-    check_hr("signal 9", oq->Signal(of.p, 9), hq->Signal(hf.p, 9));
+    check_hr("signal 9", queuelayout::queue_signal(oq.p, of.p, 9), hq->Signal(hf.p, 9));
     check_hr("block to 9", of->SetEventOnCompletion(9, nullptr), hf->SetEventOnCompletion(9, nullptr));
     check("completed at 9", of->GetCompletedValue(), hf->GetCompletedValue());
     // An event for an already-reached value returns at once.
@@ -5031,7 +5036,7 @@ int compare_fences(ID3D12Device* ours) {
     // A signal of an already-passed (lower) value: the host is free to lower the fence on some drivers, but a Vulkan
     // timeline only increases. The shim deliberately drops it and keeps the higher value (see Fence::claim in
     // d3d12_com.cpp), so this is checked against the documented behaviour, not the host.
-    check_hr("signal 3 (lower)", oq->Signal(of.p, 3), S_OK);
+    check_hr("signal 3 (lower)", queuelayout::queue_signal(oq.p, of.p, 3), S_OK);
     if (of->GetCompletedValue() != 9 && mismatches++ < 24)
         std::fprintf(stderr, "fence lower signal: ours %llu, want 9\n",
                      static_cast<unsigned long long>(of->GetCompletedValue()));
@@ -5549,9 +5554,16 @@ int main() {
             std::printf("GetResourceTiling: no host D3D12 device with tiled resources, or no layout it accepts; "
                         "skipped\n");
         EXPECT(tiling_mismatches <= 0);
-        const int argument_mismatches = compare_invalid_arguments(device.p);
+        // The console device table shares the PC's slots only up to 43 (console_slot_map): ID3D12Device4's
+        // CreateCommandList1 (PC slot 51) is one of the console's own methods in the proxy, and the proxy translates
+        // console queue flags before the PC runtime sees them. Those PC error paths run on the layer's PC device
+        // (`inner`), which the proxy wraps; the proxy's shared slots are covered by the comparisons around this one.
+        const int argument_mismatches = compare_invalid_arguments(inner);
         if (argument_mismatches < 0)
             std::printf("invalid arguments: no host D3D12 device to compare with, skipped\n");
+        else if (rt::d3d12_xs::is_device_proxy(device.p))
+            std::printf("invalid arguments: PC-only slots (CreateCommandList1 at slot 51, console queue flags) "
+                        "compared on the layer's PC device; the proxy's console table stops at slot 43\n");
         EXPECT(argument_mismatches <= 0);
         const int feature_error_mismatches = compare_check_feature_support(device.p);
         if (feature_error_mismatches < 0)
@@ -5586,7 +5598,8 @@ int main() {
             Ref<ID3D12CommandQueue> granted_q;
             EXPECT(SUCCEEDED(device->CreateCommandQueue(&rt_desc, IID_PPV_ARGS(&granted_q.p))) && granted_q.p);
             if (granted_q.p) {
-                EXPECT(granted_q->GetDesc().Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME);
+                EXPECT(queuelayout::queue_description(granted_q.p).Priority ==
+                       D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME);
             }
             granted_q.reset();
             rt::d3d12::set_global_realtime_privilege_override_for_test(-1);
@@ -5686,15 +5699,16 @@ int main() {
         UINT64 fence_last = 0;
         const auto submit_and_wait = [&] {
             const UINT64 v = ++fence_last;
-            return SUCCEEDED(queue->Signal(fence.p, v)) && SUCCEEDED(fence->SetEventOnCompletion(v, nullptr)) &&
-                   fence->GetCompletedValue() >= v;
+            return SUCCEEDED(queuelayout::queue_signal(queue.p, fence.p, v)) &&
+                   SUCCEEDED(fence->SetEventOnCompletion(v, nullptr)) && fence->GetCompletedValue() >= v;
         };
         {
             Ref<ID3D12Device> parent;
             EXPECT(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&parent.p))) && parent.p == device.p);
         }
-        // Residency and power (D3D-33): no-ops on Vulkan that still check their arguments, through the proxy's
-        // forwarded slots. EnqueueMakeResident must signal its fence, or a queue waiting on it would hang.
+        // Residency and power (D3D-33): no-ops on Vulkan that still check their arguments. MakeResident/Evict are
+        // PC slots 34/35, which the proxy forwards (and unwraps); the Device1/3 methods are PC-only and run on a
+        // direct device. EnqueueMakeResident must signal its fence, or a queue waiting on it would hang.
         {
             Ref<ID3D12Fence> residency;
             EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&residency.p))));
@@ -5709,38 +5723,53 @@ int main() {
             EXPECT(device->SetStablePowerState(FALSE) == S_OK);
 
             Ref<ID3D12Device1> device1;
-            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device1.p))));
-            const D3D12_RESIDENCY_PRIORITY priorities[] = {D3D12_RESIDENCY_PRIORITY_MAXIMUM,
-                                                           D3D12_RESIDENCY_PRIORITY(D3D12_RESIDENCY_PRIORITY_LOW + 5)};
-            // Only committed resources and heaps take a priority, as on the host runtime (d3d12_residency_test): a
-            // fence and an allocator don't.
-            EXPECT(device1->SetResidencyPriority(2, pageables, priorities) == E_INVALIDARG);
-            EXPECT(device1->SetResidencyPriority(0, nullptr, nullptr) == S_OK);
-            EXPECT(device1->SetResidencyPriority(1, pageables, nullptr) == E_INVALIDARG);
-            EXPECT(device1->SetResidencyPriority(1, nullptr, priorities) == E_INVALIDARG);
-
             Ref<ID3D12Device3> device3;
-            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device3.p))));
-            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 2, pageables, residency.p, 7) == S_OK);
-            EXPECT(residency->GetCompletedValue() == 7);
-            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET, 0, nullptr, residency.p, 9) ==
-                   S_OK);
-            EXPECT(residency->GetCompletedValue() == 9);
-            // A null fence is accepted (the host runtime's answer) and signals nothing; refused calls leave the fence
-            // alone.
-            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, pageables, nullptr, 11) == S_OK);
-            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, nullptr, residency.p, 11) ==
-                   E_INVALIDARG);
-            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAGS(0x2), 1, pageables, residency.p, 11) ==
-                   E_INVALIDARG);
-            EXPECT(residency->GetCompletedValue() == 9);
+            // ID3D12Device1's SetResidencyPriority (PC slot 46) and ID3D12Device3's EnqueueMakeResident (slot 51)
+            // are console methods in the proxy's table, not forwarded PC ones; d3d12_residency_test covers both on
+            // a direct device. The CPU signal stands in for EnqueueMakeResident's, so the queue Wait/Signal below
+            // still runs through the proxy.
+            if (!rt::d3d12_xs::is_device_proxy(device.p)) {
+                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device1.p))));
+                const D3D12_RESIDENCY_PRIORITY priorities[] = {D3D12_RESIDENCY_PRIORITY_MAXIMUM,
+                                                               D3D12_RESIDENCY_PRIORITY(D3D12_RESIDENCY_PRIORITY_LOW + 5)};
+                // Only committed resources and heaps take a priority, as on the host runtime (d3d12_residency_test):
+                // a fence and an allocator don't.
+                EXPECT(device1->SetResidencyPriority(2, pageables, priorities) == E_INVALIDARG);
+                EXPECT(device1->SetResidencyPriority(0, nullptr, nullptr) == S_OK);
+                EXPECT(device1->SetResidencyPriority(1, pageables, nullptr) == E_INVALIDARG);
+                EXPECT(device1->SetResidencyPriority(1, nullptr, priorities) == E_INVALIDARG);
+
+                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device3.p))));
+                EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 2, pageables, residency.p, 7) == S_OK);
+                EXPECT(residency->GetCompletedValue() == 7);
+                EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET, 0, nullptr, residency.p,
+                                                    9) == S_OK);
+                EXPECT(residency->GetCompletedValue() == 9);
+                // A null fence is accepted (the host runtime's answer) and signals nothing; refused calls leave the
+                // fence alone.
+                EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, pageables, nullptr, 11) == S_OK);
+                EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, nullptr, residency.p, 11) ==
+                       E_INVALIDARG);
+                EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAGS(0x2), 1, pageables, residency.p, 11) ==
+                       E_INVALIDARG);
+                EXPECT(residency->GetCompletedValue() == 9);
+            } else {
+                std::printf("residency priorities: ID3D12Device1/3 slots are console methods in the proxy, checked on "
+                            "a direct device by d3d12_residency_test; the queue Wait/Signal still run through the "
+                            "proxy\n");
+                EXPECT(SUCCEEDED(residency->Signal(9)));
+            }
             // The GPU sees the signal: a queue waits on it, then signals past it.
-            EXPECT(SUCCEEDED(queue->Wait(residency.p, 9)));
-            EXPECT(SUCCEEDED(queue->Signal(residency.p, 10)));
+            EXPECT(SUCCEEDED(queuelayout::queue_wait(queue.p, residency.p, 9)));
+            EXPECT(SUCCEEDED(queuelayout::queue_signal(queue.p, residency.p, 10)));
             EXPECT(SUCCEEDED(residency->SetEventOnCompletion(10, nullptr)) && residency->GetCompletedValue() == 10);
 
+            // ID3D12Device6 is a PC-only interface (slots past 43 are console methods in the proxy), so its
+            // background-processing check runs on the layer's PC device.
+            std::printf("background processing: ID3D12Device6's slot is a console method in the proxy, checked on the "
+                        "layer's PC device\n");
             Ref<ID3D12Device6> device6;
-            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device6.p))));
+            EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device6.p))));
             const HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             EXPECT(done);
             BOOL further = TRUE;
@@ -5760,8 +5789,11 @@ int main() {
                    E_INVALIDARG);
         }
         {
+            // ID3D12Device5's meta-command methods are PC-only (slots past 43 are console methods in the proxy).
+            std::printf("meta commands: ID3D12Device5's slots are console methods in the proxy, checked on the layer's "
+                        "PC device\n");
             Ref<ID3D12Device5> device5;
-            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device5.p))));
+            EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device5.p))));
             UINT meta_count = 7;
             EXPECT(device5->EnumerateMetaCommands(&meta_count, nullptr) == S_OK && meta_count == 0);
             EXPECT(device5->EnumerateMetaCommands(nullptr, nullptr) == E_INVALIDARG);
@@ -5780,9 +5812,12 @@ int main() {
                    D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE);
         }
         {
+            // ID3D12Device4::CreateCommandList1 is PC-only (slot 51 is a console method in the proxy).
+            std::printf("CreateCommandList1: ID3D12Device4's slot is a console method in the proxy, checked on the "
+                        "layer's PC device\n");
             Ref<ID3D12Device4> device4;
             Ref<ID3D12GraphicsCommandList> closed;
-            EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p))));
+            EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device4.p))));
             EXPECT(SUCCEEDED(device4->CreateCommandList1(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                          D3D12_COMMAND_LIST_FLAG_NONE, IID_PPV_ARGS(&closed.p))));
             EXPECT(closed->Close() == E_FAIL);  // CreateCommandList1 returns a closed list
@@ -6396,7 +6431,8 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(ms_fence.p, 1)) && SUCCEEDED(ms_fence->SetEventOnCompletion(1, nullptr)));
+            EXPECT(SUCCEEDED(queuelayout::queue_signal(queue.p, ms_fence.p, 1)) &&
+                   SUCCEEDED(ms_fence->SetEventOnCompletion(1, nullptr)));
 
             ms_view.Texture2DMSArray.FirstArraySlice = 3;  // slices 3 and 4 of a 4-slice texture
             device->CreateDepthStencilView(ms_depth.p, &ms_view, dsv0);
@@ -6405,7 +6441,8 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_subresource);
-            EXPECT(SUCCEEDED(queue->Signal(ms_fence.p, 2)) && SUCCEEDED(ms_fence->SetEventOnCompletion(2, nullptr)));
+            EXPECT(SUCCEEDED(queuelayout::queue_signal(queue.p, ms_fence.p, 2)) &&
+                   SUCCEEDED(ms_fence->SetEventOnCompletion(2, nullptr)));
         }
 
         // A render-target view of a slice range of a 4x multisampled colour array (D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY):
@@ -6460,7 +6497,8 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(ms_fence.p, 1)) && SUCCEEDED(ms_fence->SetEventOnCompletion(1, nullptr)));
+            EXPECT(SUCCEEDED(queuelayout::queue_signal(queue.p, ms_fence.p, 1)) &&
+                   SUCCEEDED(ms_fence->SetEventOnCompletion(1, nullptr)));
             const std::uint8_t red_texel[4] = {255, 0, 0, 255}, green_texel[4] = {0, 255, 0, 255};
             for (UINT s = 0; s < slices; ++s)
                 for (UINT row = 0; row < size; ++row)
@@ -6478,7 +6516,8 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::invalid_subresource);
-            EXPECT(SUCCEEDED(queue->Signal(ms_fence.p, 2)) && SUCCEEDED(ms_fence->SetEventOnCompletion(2, nullptr)));
+            EXPECT(SUCCEEDED(queuelayout::queue_signal(queue.p, ms_fence.p, 2)) &&
+                   SUCCEEDED(ms_fence->SetEventOnCompletion(2, nullptr)));
         }
 
         // 1D textures and 1D arrays use the same footprint path; one array layer is enough to prove the image
@@ -6572,11 +6611,16 @@ int main() {
             EXPECT(SUCCEEDED(device->CreateReservedResource(&xbox_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                             IID_PPV_ARGS(&xbox_tiled.p))));
             {
+                // CreateReservedResource1/2 are ID3D12Device4/10 methods, PC-only in the proxy's table (44 and up are
+                // console methods there); their resources are still the layer's, so the proxy's GetResourceTiling
+                // below sees them.
+                std::printf("CreateReservedResource1/2: PC-only slots behind the proxy, checked on the layer's PC "
+                            "device\n");
                 Ref<ID3D12Device4> device4;
                 Ref<ID3D12Device10> device10;
                 Ref<ID3D12Resource> one, two;
-                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p))));
-                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p))));
+                EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device4.p))));
+                EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device10.p))));
                 EXPECT(SUCCEEDED(device4->CreateReservedResource1(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                                   nullptr, IID_PPV_ARGS(&one.p))));
                 EXPECT(SUCCEEDED(device10->CreateReservedResource2(&tiled_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
@@ -6716,8 +6760,8 @@ int main() {
         // instead of stalling the GPU, and that the D3D12 rules for the calls are kept.
         {
             UINT64 frequency = 0;
-            EXPECT(SUCCEEDED(queue->GetTimestampFrequency(&frequency)) && frequency >= 1'000'000);
-            EXPECT(queue->GetTimestampFrequency(nullptr) == E_INVALIDARG);
+            EXPECT(SUCCEEDED(queuelayout::queue_frequency(queue.p, &frequency)) && frequency >= 1'000'000);
+            EXPECT(queuelayout::queue_frequency(queue.p, nullptr) == E_INVALIDARG);
             Ref<ID3D12QueryHeap> occlusion, timestamps, statistics, so, refused;
             D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 4, 0};
             EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&occlusion.p))));

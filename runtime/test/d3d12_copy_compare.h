@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "../shims/d3d12_com.h"
+#include "d3d12_queue_layout.h"
 #include "host_adapter.h"
 
 namespace copycmp {
@@ -230,7 +231,8 @@ struct Run {
                 return "the layer refused the list (ReplayResult " + std::to_string(int(result)) + ")";
             }
         }
-        if (FAILED(queue->Signal(fence.p, ++value)) || FAILED(fence->SetEventOnCompletion(value, nullptr)))
+        if (FAILED(queuelayout::queue_signal(queue.p, fence.p, ++value)) ||
+            FAILED(fence->SetEventOnCompletion(value, nullptr)))
             return "fence wait failed";
         if (fence->GetCompletedValue() < value) return "fence did not complete";
         if (const HRESULT hr = device->GetDeviceRemovedReason(); FAILED(hr)) return "device removed 0x" + hex(hr);
