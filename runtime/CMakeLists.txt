@@ -105,6 +105,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     src/main.cpp
     src/pe_loader.cpp
     shims/registry.cpp
+    shims/user32_probe.cpp
     shims/file_system.cpp
     shims/winhttp_offline.cpp
     shims/winsock_offline.cpp
