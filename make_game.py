@@ -1422,6 +1422,11 @@ def fspx_key_clash(spirv: str):
 
 
 BVH_DLL = "XboxBvhBuilder.dll"
+# The retail executable's own shader containers (docs/embedded_shaders.md section 2): 1 VS + 9 PS on 1.0.2.1,
+# none of them in shaders.rpf, the builder DLL or the FidelityFX DLL. They are a supplement to the builder's
+# programs and share its output folder and index; a package without the exe skips this part.
+GAME_EXE = "game_scarlett_master.exe"
+BVH_EXE_PREFIX = "exe_"   # final index names and modules: the exe's containers have no ILDN name
 BVH_TOOLS = ("pe_shader_containers.py", "fssm_unpack.py", "shader_disasm.py")   # as FSPX_TOOLS, for the builder
 # rdna2spirv.py's --max-shared-memory for the builder's programs: 32768, the maxComputeSharedMemorySize of the AMD
 # Windows and Intel drivers (docs/design.md, "Workgroup memory limit"). The constructor creates a pipeline for every
@@ -1432,10 +1437,18 @@ BVH_TOOLS = ("pe_shader_containers.py", "fssm_unpack.py", "shader_disasm.py")   
 BVH_MAX_SHARED_MEMORY = 32768
 
 
-def bvh_settings(dll: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
-    """What the builder's outputs depend on, as one line: the DLL, the extracting, unpacking and translating tools,
-    llvm-mc, the wave64 mode, the fallback flags and the workgroup-memory cap."""
-    return json.dumps({"dll": file_sha256(dll), "tools": sources_digest(TOOLS, BVH_TOOLS),
+def bvh_settings(dll: str, exe: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...],
+                 exe_index: str = "") -> str:
+    """What the builder's and the exe's outputs depend on, as one line: both images, the exe's extraction index,
+    the extracting, unpacking and translating tools, llvm-mc, the wave64 mode, the fallback flags and the
+    workgroup-memory cap. The exe and its index are None when the package has no exe, so its absence is part of
+    the digest too (an exe added to or removed from the package runs the step again)."""
+    exe_present = bool(exe) and os.path.isfile(exe)
+    return json.dumps({"dll": file_sha256(dll) if dll and os.path.isfile(dll) else None,
+                       "exe": file_sha256(exe) if exe_present else None,
+                       "exe_index": file_sha256(exe_index) if exe_present and exe_index and os.path.isfile(exe_index)
+                       else None,
+                       "tools": sources_digest(TOOLS, BVH_TOOLS),
                        "translator": translation_sources_digest(), "llvm_mc": mc_signature,
                        "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks),
                        "max_shared_memory": BVH_MAX_SHARED_MEMORY}, sort_keys=True)
@@ -1458,6 +1471,72 @@ def bvh_programs(unpacked: str, spirv: str) -> "tuple[list[str], list[str]] | No
     return extracted, [name for name in extracted if name not in found]
 
 
+def exe_programs(unpacked: str, spirv: str) -> "tuple[list[str], list[str]] | None":
+    """The exe's extracted containers (their file stems) and the ones the runtime cannot find under their
+    BVH_EXE_PREFIX name in <spirv>/index.json. An extraction index with no containers gives ([], []). None when the
+    records the step needs are missing or unreadable, or the index names a module that is not there."""
+    try:
+        extracted = sorted(shader_stems(os.path.join(unpacked, "index.json"), "file", ".dxbc"))
+        if not extracted:
+            return [], []
+        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(index, dict) or not all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index):
+        return None
+    found = {name for name, meta in index.items()
+             if isinstance(meta, dict) and isinstance(meta.get("fssm_sha256"), str)}
+    return extracted, [name for name in extracted if BVH_EXE_PREFIX + name not in found]
+
+
+def merge_exe_index(spirv: str, exe_translated: str) -> int:
+    """Append the exe's translated entries to <spirv>/index.json and copy their modules beside it, under
+    BVH_EXE_PREFIX names. Only entries with an fssm_sha256 and a module are added. The index is written last, after
+    every module, so it never names one that is not there. Returns the number added."""
+    try:
+        with open(os.path.join(exe_translated, "index.json"), encoding="utf-8") as f:
+            extra = json.load(f)
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(extra, dict):
+        return 0
+    index_path = os.path.join(spirv, "index.json")
+    index = {}
+    if os.path.isfile(index_path):
+        try:
+            with open(index_path, encoding="utf-8") as f:
+                index = json.load(f)
+        except (OSError, ValueError):
+            return 0
+        if not isinstance(index, dict):
+            return 0
+    os.makedirs(spirv, exist_ok=True)
+    added = 0
+    for name, meta in extra.items():
+        if not isinstance(meta, dict) or not isinstance(meta.get("fssm_sha256"), str):
+            continue
+        module = os.path.join(exe_translated, name + ".spv")
+        if not os.path.isfile(module):
+            continue
+        final = BVH_EXE_PREFIX + name
+        if final in index:
+            fail(f"shaders: {GAME_EXE}'s container {name} would replace the {BVH_DLL} program {final} in "
+                 f"{index_path}. Rename one of them before running the shaders stage again.")
+        shutil.copyfile(module, os.path.join(spirv, final + ".spv"))
+        index[final] = meta
+        added += 1
+    if not added:
+        return 0
+    tmp = index_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(index, f, indent=0)
+        f.flush()
+        os.fsync(f.fileno())
+    replace_retry(tmp, index_path)
+    return added
+
+
 def bvh_report(programs: "tuple[list[str], list[str]]") -> None:
     """One line with the counts, and one that names every program left without a module. It is printed on every
     run, also when the step itself is reused: a program the translator has no rule for is never dropped quietly."""
@@ -1470,38 +1549,34 @@ def bvh_report(programs: "tuple[list[str], list[str]]") -> None:
             "prints the instruction each one stops at (docs/embedded_shaders.md, section 4)")
 
 
-def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate: bool = False,
-                fallbacks: tuple[str, ...] = ()) -> None:
-    """XboxBvhBuilder.dll's compute programs (docs/embedded_shaders.md): pe_shader_containers.py extracts the DLL's
-    DXBC containers into <work>/shaders/bvh, fssm_unpack.py and shader_disasm.py unpack and disassemble their FSSM
-    programs there, as for a shader from shaders.rpf, and rdna2spirv.py translates them into
-    <work>/shaders/spirv/bvh, where the runtime's shader library finds them by fssm_sha256, the key of the game's
-    own shaders. Those neither feed nor depend on this step.
+def exe_report(programs: "tuple[list[str], list[str]]") -> None:
+    """The same counts for the executable's containers, named by their extraction stems."""
+    extracted, missing = programs
+    log(f"shaders: {len(extracted) - len(missing)} of {len(extracted)} {GAME_EXE} programs translated")
+    if missing:
+        one = len(missing) == 1
+        log(f"shaders: NOT translated: {', '.join(missing)}. The runtime has no module for "
+            f"{'it' if one else 'them'}, so the pipeline that uses {'it' if one else 'them'} is refused "
+            "(E_INVALIDARG). When the step runs, rdna2spirv.py prints the instruction each one stops at")
 
-    The 52 programs take seconds, so the step runs whole. Reuse requires both indexes, the translated modules and a
-    matching bvh_build.json (bvh_settings)."""
-    dll = os.path.join(game, BVH_DLL)
-    unpacked = os.path.join(work, "shaders", "bvh")
-    spirv = os.path.join(work, "shaders", "spirv", "bvh")
-    extracted = os.path.join(unpacked, "index.json")
-    unpack_index = os.path.join(unpacked, "fssm_index.json")
-    translated = os.path.join(spirv, "index.json")
-    settings_file = os.path.join(spirv, "bvh_build.json")
-    if not os.path.isfile(dll):
-        # A work folder used before with a package that had the DLL still holds that run's index, and the runtime
-        # loads <shaders>/bvh/index.json whenever it is there. Without the index the old modules are not found.
-        drop(translated, settings_file)
-        log(f"shaders: no {BVH_DLL} in the game folder, so no BVH builder programs to translate")
-        return
-    settings = bvh_settings(dll, mc_signature, emulate, fallbacks)
-    programs = bvh_programs(unpacked, spirv) if read_shader_setting(settings_file) == settings else None
-    if programs:
-        bvh_report(programs)
-        return
-    log(f"shaders: extracting and translating the compute programs of {BVH_DLL}")
-    drop(translated, settings_file, extracted, unpack_index)
-    # pe_shader_containers.py never overwrites a container (a second run would write <module>_NN.dxbc beside the
-    # first), and a program that no longer translates must not keep a module from the run before.
+
+def has_xbch_container(unpacked: str, stems: list[str]) -> bool:
+    """Whether at least one extracted container carries the console program record. An older executable can yield
+    valid DXBC containers with no XBCH; fssm_unpack.py would exit non-zero on them, and the exe part is optional."""
+    for stem in stems:
+        try:
+            with open(os.path.join(unpacked, stem + ".dxbc"), "rb") as f:
+                if b"XBCH" in f.read():
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def clear_bvh_outputs(unpacked: str, spirv: str, exe_unpacked: str, exe_translated: str) -> None:
+    """Remove what the previous run wrote: pe_shader_containers.py never overwrites a container (a second run would
+    write <module>_NN.dxbc beside the first), and a program that no longer translates must not keep a module from
+    the run before. The exe's folders are removed whole so its container numbering cannot drift."""
     for folder, suffixes in ((unpacked, (".dxbc",)), (os.path.join(unpacked, "fssm"), (".fssm",)),
                              (os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
         if os.path.isdir(folder):
@@ -1509,23 +1584,104 @@ def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
                 for entry in entries:
                     if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
                         os.unlink(entry.path)
-    py("pe_shader_containers.py", dll, "--extract", unpacked)
-    py("fssm_unpack.py", unpacked, "--carve-index", extracted)
-    # rdna2spirv.py reads each program's stage from index.json and its FSSM blob from fssm/, both in the parent of
-    # the listings' folder, so the disassembly sits inside the extraction folder as it does for shaders.rpf.
-    disasm = os.path.join(unpacked, "disasm")
-    py("shader_disasm.py", os.path.join(unpacked, "fssm"), "--unpack-index", unpack_index, "--out", disasm,
-       "--mcpu", "gfx1013", "--jobs", jobs)
+    for folder in (exe_unpacked, exe_translated):
+        if os.path.isdir(folder):
+            shutil.rmtree(folder)
+
+
+def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate: bool = False,
+                fallbacks: tuple[str, ...] = ()) -> None:
+    """XboxBvhBuilder.dll's compute programs and the retail executable's own shader containers
+    (docs/embedded_shaders.md): pe_shader_containers.py extracts the DLL's DXBC containers into <work>/shaders/bvh
+    and the exe's into <work>/shaders/bvh/exe, fssm_unpack.py and shader_disasm.py unpack and disassemble their FSSM
+    programs there, as for a shader from shaders.rpf, and rdna2spirv.py translates them into
+    <work>/shaders/spirv/bvh, where the runtime's shader library finds them by fssm_sha256, the key of the game's
+    own shaders. The exe's modules and entries share the builder's folder and index under BVH_EXE_PREFIX names.
+    Those neither feed nor depend on this step.
+
+    The programs take seconds, so the step runs whole. Reuse requires both indexes, the translated modules and a
+    matching bvh_build.json (bvh_settings). A package without the exe, or an exe with no shader containers, skips
+    only the exe part; without both images the step removes its old index and does nothing."""
+    dll = os.path.join(game, BVH_DLL)
+    exe = os.path.join(game, GAME_EXE)
+    unpacked = os.path.join(work, "shaders", "bvh")
+    exe_unpacked = os.path.join(unpacked, "exe")
+    spirv = os.path.join(work, "shaders", "spirv", "bvh")
+    exe_translated = os.path.join(spirv, "exe")
+    extracted = os.path.join(unpacked, "index.json")
+    exe_extracted = os.path.join(exe_unpacked, "index.json")
+    unpack_index = os.path.join(unpacked, "fssm_index.json")
+    exe_unpack_index = os.path.join(exe_unpacked, "fssm_index.json")
+    translated = os.path.join(spirv, "index.json")
+    settings_file = os.path.join(spirv, "bvh_build.json")
+    dll_present, exe_present = os.path.isfile(dll), os.path.isfile(exe)
+    if not dll_present and not exe_present:
+        # A work folder used before with a package that had the DLL still holds that run's index, and the runtime
+        # loads <shaders>/bvh/index.json whenever it is there. Without the index the old modules are not found.
+        drop(translated, settings_file)
+        log(f"shaders: no {BVH_DLL} in the game folder, so no BVH builder programs to translate")
+        return
+    settings = bvh_settings(dll, exe, mc_signature, emulate, fallbacks, exe_extracted)
+    dll_programs = bvh_programs(unpacked, spirv) if dll_present else ([], [])
+    exe_progs = exe_programs(exe_unpacked, spirv) if exe_present and os.path.isfile(exe_extracted) else None
+    reusable = (read_shader_setting(settings_file) == settings and dll_programs is not None
+                and (not exe_present or exe_progs is not None))
+    if reusable:
+        if dll_present:
+            bvh_report(dll_programs)
+        if exe_present:
+            if exe_progs and exe_progs[0]:
+                exe_report(exe_progs)
+            else:
+                log(f"shaders: {GAME_EXE} holds no shader containers; skipping its programs")
+        return
+    if dll_present:
+        log(f"shaders: extracting and translating the compute programs of {BVH_DLL}")
+    if exe_present:
+        log(f"shaders: extracting and translating the embedded shaders of {GAME_EXE}")
+    drop(translated, settings_file, extracted, unpack_index, exe_extracted, exe_unpack_index)
+    clear_bvh_outputs(unpacked, spirv, exe_unpacked, exe_translated)
     extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
-    py("rdna2spirv.py", disasm, "--out", spirv, "--no-asm", "--max-shared-memory", BVH_MAX_SHARED_MEMORY, *extra)
-    programs = bvh_programs(unpacked, spirv)
-    if not programs or len(programs[1]) == len(programs[0]):
-        drop(translated)   # an empty or unreadable index would read as a finished step
-        fail(f"shaders: none of the {BVH_DLL} programs translated, so their index is not kept. Run the shaders "
-             "stage again; if it happens again, the tool output above is why.")
-    bvh_report(programs)
-    with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
-        f.write(settings + "\n")
+    if dll_present:
+        py("pe_shader_containers.py", dll, "--extract", unpacked)
+        py("fssm_unpack.py", unpacked, "--carve-index", extracted)
+        # rdna2spirv.py reads each program's stage from index.json and its FSSM blob from fssm/, both in the parent
+        # of the listings' folder, so the disassembly sits inside the extraction folder as it does for shaders.rpf.
+        disasm = os.path.join(unpacked, "disasm")
+        py("shader_disasm.py", os.path.join(unpacked, "fssm"), "--unpack-index", unpack_index, "--out", disasm,
+           "--mcpu", "gfx1013", "--jobs", jobs)
+        py("rdna2spirv.py", disasm, "--out", spirv, "--no-asm", "--max-shared-memory", BVH_MAX_SHARED_MEMORY, *extra)
+        dll_programs = bvh_programs(unpacked, spirv)
+        if not dll_programs or len(dll_programs[1]) == len(dll_programs[0]):
+            drop(translated)   # an empty or unreadable index would read as a finished step
+            fail(f"shaders: none of the {BVH_DLL} programs translated, so their index is not kept. Run the shaders "
+                 "stage again; if it happens again, the tool output above is why.")
+        bvh_report(dll_programs)
+    exe_progs = ([], [])
+    if exe_present:
+        py("pe_shader_containers.py", exe, "--extract", exe_unpacked)
+        exe_stems = sorted(shader_stems(exe_extracted, "file", ".dxbc"))
+        if not exe_stems or not has_xbch_container(exe_unpacked, exe_stems):
+            log(f"shaders: {GAME_EXE} holds no shader containers; skipping its programs")
+        else:
+            py("fssm_unpack.py", exe_unpacked, "--carve-index", exe_extracted)
+            exe_disasm = os.path.join(exe_unpacked, "disasm")
+            py("shader_disasm.py", os.path.join(exe_unpacked, "fssm"), "--unpack-index", exe_unpack_index,
+               "--out", exe_disasm, "--mcpu", "gfx1013", "--jobs", jobs)
+            py("rdna2spirv.py", exe_disasm, "--out", exe_translated, "--no-asm", *extra)
+            merge_exe_index(spirv, exe_translated)
+            # The modules now sit beside the index under their final names; the staging folder is not read again.
+            if os.path.isdir(exe_translated):
+                shutil.rmtree(exe_translated)
+            exe_progs = exe_programs(exe_unpacked, spirv) or (exe_stems, exe_stems)
+            exe_report(exe_progs)
+    if os.path.isfile(translated):
+        # Recomputed after the extraction: the exe's index is part of what a later run compares against.
+        settings = bvh_settings(dll, exe, mc_signature, emulate, fallbacks, exe_extracted)
+        with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
+            f.write(settings + "\n")
+    else:
+        drop(settings_file)
 
 
 WAVE64_MODES = ("auto", "on", "off")

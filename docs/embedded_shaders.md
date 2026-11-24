@@ -244,8 +244,8 @@ bare magic, a truncated chunk, an `ACCC`/`FSPX` container, the `ILDN` name and t
 ## 7. Build step and run-time lookup
 
 **Build (D3D-557).** `make_game.py`'s `shaders` stage, after the game's own shaders and the FidelityFX step, runs
-`bvh_shaders()` on the package's `XboxBvhBuilder.dll`. It is the recipe of section 4, with the extraction index
-passed along so that each tool reads only what the one before it wrote:
+`bvh_shaders()` on the package's `XboxBvhBuilder.dll` and `game_scarlett_master.exe`. It is the recipe of section 4,
+with the extraction index passed along so that each tool reads only what the one before it wrote:
 
 ```sh
 python -I tools/pe_shader_containers.py <game>/XboxBvhBuilder.dll --extract <work>/shaders/bvh
@@ -254,7 +254,14 @@ python -I tools/shader_disasm.py <work>/shaders/bvh/fssm --unpack-index <work>/s
 python -I tools/rdna2spirv.py <work>/shaders/bvh/disasm --out <work>/shaders/spirv/bvh --no-asm --max-shared-memory 32768
 ```
 
-The last line also gets `--wave64-emulate` and the fallback flags of the build, like the game's shaders.
+The last line also gets `--wave64-emulate` and the fallback flags of the build, like the game's shaders. The
+executable's 10 containers then run the same four tools in `<work>/shaders/bvh/exe`, translate into a staging
+folder, and are appended to the same `<work>/shaders/spirv/bvh/index.json` and module folder under `exe_<stem>`
+names (`exe_container_00` … for 1.0.2.1, whose containers carry no `ILDN`). The exe's translator call gets the same
+wave64 and fallback flags but not `--max-shared-memory`, which only computes need. The extraction index is part of
+`bvh_build.json`, which also records both images, so a different exe reruns the step; an exe with no containers is
+skipped and a package without one keeps the builder's 52 entries alone. A name collision with a builder module fails
+the step instead of replacing an entry.
 
 * **The key is the game shaders' key.** The programs are `FSSM` (section 4), so each index entry gets
   `fssm_sha256`, the SHA-256 of the blob `fssm_unpack.py` inflates from the container's `XBCH` record. That is what
@@ -387,9 +394,10 @@ than the bound, `--dispatch-loop`); [testing.md](testing.md), "Known problems", 
 Still open: nothing has dispatched one of these pipelines through the D3D12 layer, so this shows that the
 constructor's pipelines are created, not that a build produces the right tree (section 5).
 
-`tests/test_bvh_shaders_stage.py` runs the step on a synthetic DLL (hand-built containers around a made-up `FSSM`
-blob, no game data): the key the extracted layout gives the translator, the tools and arguments, reuse and each
-reason to run again, a second run that leaves no duplicate containers, the report of an untranslated program on
-every run and the failure when nothing translates. `shader_library_test` covers the `bvh/` index (found by the
-container's program hash, counted apart, a broken or missing index beside the others) and `d3d12_compute_test`
-creates a pipeline through slot 62 whose only translation is in `<shaders>/bvh/index.json`.
+`tests/test_bvh_shaders_stage.py` runs the step on a synthetic DLL and executable (hand-built containers around a
+made-up `FSSM` blob, no game data): the key the extracted layout gives the translator, the tools and arguments,
+reuse and each reason to run again, a second run that leaves no duplicate containers, the report of an untranslated
+program on every run, the failure when nothing translates, and the exe's four commands, merged `exe_` entries,
+digest and skip when it has no containers. `shader_library_test` covers the `bvh/` index (found by the container's
+program hash, counted apart, a broken or missing index beside the others) and `d3d12_compute_test` creates a
+pipeline through slot 62 whose only translation is in `<shaders>/bvh/index.json`.

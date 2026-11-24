@@ -2,9 +2,10 @@
 
     python -I tests/test_bvh_shaders_stage.py
 
-Zero game data: the "DLL" is synthetic bytes around hand-built DXBC containers whose XBCH record is a zlib stream of
-a made-up FSSM blob, and llvm-mc and the translator are stood in for the way tests/test_fspx_shaders_stage.py does.
-The extracting, unpacking and disassembling tools are the repository's own, run as make_game.py runs them.
+Zero game data: the "DLL" and "exe" are synthetic bytes around hand-built DXBC containers whose XBCH record is a
+zlib stream of a made-up FSSM blob, and llvm-mc and the translator are stood in for the way
+tests/test_fspx_shaders_stage.py does. The extracting, unpacking and disassembling tools are the repository's own,
+run as make_game.py runs them.
 """
 import hashlib
 import io
@@ -47,6 +48,15 @@ def builder_container(name: str, blob: bytes) -> bytes:
     prefix = b"e\x00\x05\x00" + struct.pack("<I", 24) + b"DXIL" + b"\x05\x01\x00\x00" + struct.pack("<II", 0x70, 0x668)
     dxil = prefix + xdat([(0x12, bytes(16)), (0x0D, xbch), (0x07, b"BC\xc0\xde" + bytes(8))], len(prefix))
     return container([(b"SFI0", bytes(8)), (b"ILDN", ildn(name)), (b"DXIL", dxil)])
+
+
+def exe_container(blob: bytes) -> bytes:
+    """A retail-exe container: SFI0 + DXIL/XDAT XBCH, with no ILDN (pe_shader_containers.py names it container_NN)."""
+    packed = zlib.compress(blob)
+    xbch = b"XBCH" + struct.pack("<IIIII", 1, len(packed), 0, len(blob), 0) + packed
+    prefix = b"e\x00\x05\x00" + struct.pack("<I", 24) + b"DXIL" + b"\x05\x01\x00\x00" + struct.pack("<II", 0x70, 0x668)
+    dxil = prefix + xdat([(0x12, bytes(16)), (0x0D, xbch), (0x07, b"BC\xc0\xde" + bytes(8))], len(prefix))
+    return container([(b"SFI0", bytes(8)), (b"DXIL", dxil)])
 
 
 def dll_like(*containers: bytes) -> bytes:
@@ -101,8 +111,8 @@ class IndexKey(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(out, "NoProgram.dxbc")))
 
 
-class BvhStage(unittest.TestCase):
-    """Which tools bvh_shaders() runs and what it reports. Each stand-in writes what the real tool writes last."""
+class BvhFixture:
+    """The folders and stand-in tools both stage classes use; subclasses hold the tests."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -111,16 +121,26 @@ class BvhStage(unittest.TestCase):
         self.game = os.path.join(self.tmp.name, "game")
         os.makedirs(self.game)
         self.dll = os.path.join(self.game, make_game.BVH_DLL)
+        self.exe = os.path.join(self.game, make_game.GAME_EXE)
         self.programs = {"SortKeys": fssm_blob(1), "WriteNodes": fssm_blob(2), "CopyNodes": fssm_blob(3)}
+        self.exe_programs = {}           # the exe's containers; empty means the file holds none
+        self.exe_xbch = True             # False: an older exe whose containers carry no console program
         self.untranslated = set()        # the programs the stand-in translator has no rule for
         self.write_dll()
         self.unpacked = os.path.join(self.work, "shaders", "bvh")
+        self.exe_unpacked = os.path.join(self.unpacked, "exe")
         self.spirv = os.path.join(self.work, "shaders", "spirv", "bvh")
+        self.exe_translated = os.path.join(self.spirv, "exe")
         self.calls, self.logs = [], []
 
     def write_dll(self):
         with open(self.dll, "wb") as f:
             f.write(dll_like(*(builder_container(name, blob) for name, blob in self.programs.items())))
+
+    def write_exe(self):
+        with open(self.exe, "wb") as f:
+            f.write(b"MZ" + b"\0" * 126 + b"".join(exe_container(blob) + b"\xcc" * 12
+                                                   for blob in self.exe_programs.values()))
 
     def fake_translate(self, *args):
         """rdna2spirv.py: a module and an index entry for every listing it has a rule for."""
@@ -140,23 +160,29 @@ class BvhStage(unittest.TestCase):
 
     def fake_py(self, tool_name, *args):
         self.calls.append((tool_name, args))
+        target = args[0] if args else ""
+        is_exe = target == self.exe or (os.path.isdir(self.exe_unpacked)
+                                        and os.path.abspath(target).startswith(os.path.abspath(self.exe_unpacked)))
+        folder = self.exe_unpacked if is_exe else self.unpacked
+        programs = self.exe_programs if is_exe else self.programs
         if tool_name == "pe_shader_containers.py":
-            os.makedirs(self.unpacked, exist_ok=True)
-            for name in self.programs:
-                open(os.path.join(self.unpacked, name + ".dxbc"), "wb").close()
-            with open(os.path.join(self.unpacked, "index.json"), "w", encoding="utf-8", newline="\n") as f:
-                json.dump([{"name": n, "file": n + ".dxbc", "stage": "cs"} for n in self.programs], f)
+            os.makedirs(folder, exist_ok=True)
+            for name in programs:
+                with open(os.path.join(folder, name + ".dxbc"), "wb") as f:
+                    f.write(b"DXBC\0\0\0\0XBCH" if is_exe and self.exe_xbch else b"")
+            with open(os.path.join(folder, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump([{"name": n, "file": n + ".dxbc", "stage": "cs"} for n in programs], f)
         elif tool_name == "fssm_unpack.py":
-            os.makedirs(os.path.join(self.unpacked, "fssm"), exist_ok=True)
-            for name, blob in self.programs.items():
-                with open(os.path.join(self.unpacked, "fssm", name + ".fssm"), "wb") as f:
+            os.makedirs(os.path.join(folder, "fssm"), exist_ok=True)
+            for name, blob in programs.items():
+                with open(os.path.join(folder, "fssm", name + ".fssm"), "wb") as f:
                     f.write(blob)
-            with open(os.path.join(self.unpacked, "fssm_index.json"), "w", encoding="utf-8", newline="\n") as f:
-                json.dump([{"name": n} for n in self.programs], f)
+            with open(os.path.join(folder, "fssm_index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump([{"name": n} for n in programs], f)
         elif tool_name == "shader_disasm.py":
-            os.makedirs(os.path.join(self.unpacked, "disasm"), exist_ok=True)
-            for name in self.programs:
-                with open(os.path.join(self.unpacked, "disasm", name + ".s"), "w", encoding="utf-8",
+            os.makedirs(os.path.join(folder, "disasm"), exist_ok=True)
+            for name in programs:
+                with open(os.path.join(folder, "disasm", name + ".s"), "w", encoding="utf-8",
                           newline="\n") as f:
                     f.write("s_endpgm\n")
         elif tool_name == "rdna2spirv.py":
@@ -168,6 +194,10 @@ class BvhStage(unittest.TestCase):
                 mock.patch.object(make_game, "log", self.logs.append):
             make_game.bvh_shaders(self.game, self.work, signature, 3, emulate=emulate, fallbacks=fallbacks)
         return [name for name, _ in self.calls]
+
+
+class BvhStage(BvhFixture, unittest.TestCase):
+    """Which tools bvh_shaders() runs and what it reports. Each stand-in writes what the real tool writes last."""
 
     def test_runs_once_then_only_reports(self):
         self.assertEqual(self.run_step(), TOOLS)
@@ -335,6 +365,115 @@ class BvhStage(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.spirv, "notes.txt")))
         self.assertEqual(self.run_step(signature="llvm-mc 24"), TOOLS)
         self.assertEqual(self.run_step(signature="llvm-mc 24"), [])
+
+
+class ExeShadersStage(BvhFixture, unittest.TestCase):
+    """The retail executable's own containers share the builder's folders and index (docs/embedded_shaders.md
+    section 2): they run after the DLL's four tools, land under BVH_EXE_PREFIX names, and are reused with them."""
+
+    def setUp(self):
+        super().setUp()
+        self.exe_programs = {"container_00": fssm_blob(11), "container_01": fssm_blob(12)}
+        self.write_exe()
+
+    def test_runs_after_the_dll_and_merges_the_same_index(self):
+        self.assertEqual(self.run_step(), TOOLS + TOOLS)
+        (_, dll_extract), (_, dll_unpack), (_, dll_disasm), (_, dll_translate), \
+            (_, exe_extract), (_, exe_unpack), (_, exe_disasm), (_, exe_translate) = self.calls
+        self.assertEqual(dll_extract, (self.dll, "--extract", self.unpacked))
+        self.assertEqual(exe_extract, (self.exe, "--extract", self.exe_unpacked))
+        self.assertEqual(exe_unpack, (self.exe_unpacked, "--carve-index",
+                                      os.path.join(self.exe_unpacked, "index.json")))
+        self.assertEqual(exe_disasm, (os.path.join(self.exe_unpacked, "fssm"), "--unpack-index",
+                                      os.path.join(self.exe_unpacked, "fssm_index.json"), "--out",
+                                      os.path.join(self.exe_unpacked, "disasm"), "--mcpu", "gfx1013", "--jobs", 3))
+        self.assertEqual(exe_translate, (os.path.join(self.exe_unpacked, "disasm"), "--out",
+                                         self.exe_translated, "--no-asm"))
+        self.assertIn("--no-asm", dll_translate)
+        with open(os.path.join(self.spirv, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+        self.assertEqual(set(index), set(self.programs) | {make_game.BVH_EXE_PREFIX + n for n in self.exe_programs})
+        for name, blob in self.exe_programs.items():
+            self.assertEqual(index[make_game.BVH_EXE_PREFIX + name]["fssm_sha256"],
+                             hashlib.sha256(blob).hexdigest())
+            self.assertTrue(os.path.isfile(os.path.join(self.spirv, make_game.BVH_EXE_PREFIX + name + ".spv")))
+        self.assertFalse(os.path.exists(self.exe_translated))
+        self.assertIn(f"shaders: 2 of 2 {make_game.GAME_EXE} programs translated", self.logs)
+        self.assertEqual(self.run_step(), [])
+        self.assertIn(f"shaders: 3 of 3 {make_game.BVH_DLL} programs translated", self.logs)
+        self.assertIn(f"shaders: 2 of 2 {make_game.GAME_EXE} programs translated", self.logs)
+
+    def test_the_exe_mode_and_fallbacks_reach_the_translator(self):
+        self.run_step(emulate=True, fallbacks=("--no-float-controls",))
+        for _, args in (self.calls[3], self.calls[7]):
+            self.assertIn("--wave64-emulate", args)
+            self.assertIn("--no-float-controls", args)
+        self.assertNotIn("--max-shared-memory", self.calls[7][1])   # graphics: the builder's cap is not needed
+
+    def test_a_different_exe_reruns_and_replaces_the_old_entries(self):
+        self.assertEqual(self.run_step(), TOOLS + TOOLS)
+        self.exe_programs = {"container_00": fssm_blob(21)}
+        self.write_exe()
+        self.assertEqual(self.run_step(), TOOLS + TOOLS)
+        with open(os.path.join(self.spirv, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+        self.assertEqual(set(index), set(self.programs) | {make_game.BVH_EXE_PREFIX + "container_00"})
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, make_game.BVH_EXE_PREFIX + "container_01.spv")))
+
+    def test_an_exe_without_containers_is_skipped_and_reused(self):
+        self.exe_programs = {}
+        self.write_exe()
+        self.assertEqual(self.run_step(), TOOLS + ["pe_shader_containers.py"])
+        with open(os.path.join(self.spirv, "index.json"), encoding="utf-8") as f:
+            self.assertEqual(set(json.load(f)), set(self.programs))
+        self.assertIn(f"shaders: {make_game.GAME_EXE} holds no shader containers; skipping its programs", self.logs)
+        self.assertEqual(self.run_step(), [])
+        self.assertIn(f"shaders: {make_game.GAME_EXE} holds no shader containers; skipping its programs", self.logs)
+
+    def test_an_older_exe_without_xbch_is_skipped(self):
+        self.exe_xbch = False
+        self.assertEqual(self.run_step(), TOOLS + ["pe_shader_containers.py"])
+        with open(os.path.join(self.spirv, "index.json"), encoding="utf-8") as f:
+            self.assertEqual(set(json.load(f)), set(self.programs))
+        self.assertIn(f"shaders: {make_game.GAME_EXE} holds no shader containers; skipping its programs", self.logs)
+
+    def test_the_exe_runs_when_the_builder_dll_is_absent(self):
+        os.remove(self.dll)
+        self.assertEqual(self.run_step(), TOOLS)
+        with open(os.path.join(self.spirv, "index.json"), encoding="utf-8") as f:
+            self.assertEqual(set(json.load(f)), {make_game.BVH_EXE_PREFIX + n for n in self.exe_programs})
+        self.assertIn(f"shaders: 2 of 2 {make_game.GAME_EXE} programs translated", self.logs)
+        self.assertEqual(self.run_step(), [])
+
+    def test_an_untranslated_exe_program_is_named(self):
+        self.untranslated = {"container_01"}
+        self.assertEqual(self.run_step(), TOOLS + TOOLS)
+        self.assertIn(f"shaders: 1 of 2 {make_game.GAME_EXE} programs translated", self.logs)
+        self.assertEqual(len([line for line in self.logs if "NOT translated: container_01." in line]), 1)
+        self.assertIn(f"shaders: 1 of 2 {make_game.GAME_EXE} programs translated", self.logs)
+
+    def test_the_digest_covers_the_exe_and_its_extraction_index(self):
+        index = os.path.join(self.tmp.name, "exe-index.json")
+        with open(index, "w", encoding="utf-8", newline="\n") as f:
+            f.write("[]\n")
+        settings = json.loads(make_game.bvh_settings(self.dll, self.exe, "llvm-mc 23", False, (), index))
+        with open(self.exe, "rb") as f:
+            self.assertEqual(settings["exe"], hashlib.sha256(f.read()).hexdigest())
+        self.assertEqual(settings["exe_index"], hashlib.sha256(b"[]\n").hexdigest())
+        with open(self.dll, "rb") as f:
+            self.assertEqual(settings["dll"], hashlib.sha256(f.read()).hexdigest())
+        before = make_game.bvh_settings(self.dll, self.exe, "llvm-mc 23", False, (), index)
+        with open(index, "w", encoding="utf-8", newline="\n") as f:
+            f.write("[{}]\n")
+        after_index = make_game.bvh_settings(self.dll, self.exe, "llvm-mc 23", False, (), index)
+        self.assertNotEqual(before, after_index)
+        self.exe_programs = {"container_00": fssm_blob(31)}
+        self.write_exe()
+        self.assertNotEqual(after_index, make_game.bvh_settings(self.dll, self.exe, "llvm-mc 23", False, (), index))
+        os.remove(self.exe)
+        absent = json.loads(make_game.bvh_settings(self.dll, self.exe, "llvm-mc 23", False, (), index))
+        self.assertIsNone(absent["exe"])
+        self.assertIsNone(absent["exe_index"])
 
 
 class ShadersStageWithTheDlls(unittest.TestCase):
