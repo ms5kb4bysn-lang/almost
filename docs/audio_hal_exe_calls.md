@@ -78,9 +78,9 @@ first run reported in #6603 stops earlier, in `D3D12ConfigureVirtualMemoryX`.
 Nothing here says that the boot reaches these calls, in what order, or what the commands and results carry. A site is code
 that can call; the first trace (`--trace`, `unimplemented_call` events) is the signal for which of them run.
 
-## Argument orders decoded for the boot shim (feat/acphal-shim, based on a6cfb4161)
+## Argument orders decoded for the boot shim (feat/acphal-shim, on c0c5eb2a0)
 
-Reading the registers set immediately before each call (not only the counts above) settles five shapes that the table
+Reading the registers set immediately before each call (not only the counts above) settles six shapes that the table
 alone leaves open. `runtime/shims/acphal.cpp` implements them; its file header has the per-site evidence.
 
 - `AcpHalAllocateShapeContexts` takes **one pointer to a descriptor**, not an out pointer. At `+0x43aec4b` rcx is
@@ -96,7 +96,10 @@ alone leaves open. `runtime/shims/acphal.cpp` implements them; its file header h
   size, the fourth `0x800`.
 - `ApuMapVirtualAddress` takes **the pointer alone**: the call at `+0x7879c` (and the other three) reloads only rcx;
   the `0x40`/`0x80`/`0x800` in edx is the leftover size of the preceding `ApuIsVirtualAddressValid`.
-- `XApuConnect` takes **three pointers**: the two queue descriptors at RVA `0x9ae9890` and `0x9ae98a8`, then the out
-  handle `0x9ae8960` that every other xapu call reads. The first qword of the second descriptor is later read as the
-  command buffer base (`+0x4e64b45`, `+0x4f20afe`, `+0x4f20b64`); its init at `+0x5a8797c` only zeroes it and no other
-  direct write in the image was found, so connect is the likely filler.
+- `XApuConnect` takes **three pointers**: input at RVA `0x9ae9890` (24 bytes: process=1, streams=0x100,
+  commands_per_stream=2, memory=0x104, frames_per_output=0, options=1), output at `0x9ae98a8` (`{void* memory;
+  HANDLE result_event}`) and the out handle at `0x9ae8960`, which every other xapu call reads. The memory field is
+  4 KiB pages there (`0x104000` bytes). The process command built at `+0x4f20b7e` is 0x40 bytes after a **24-byte**
+  packed id (four dwords and a qword, not 20), and the result read at `+0x4eaa8a3` is 0x50 bytes with `kind` at +0,
+  `stream` at +4 and `output_length` at +0x34. An empty dequeue returns `0x8AC81001` (PENDING_RESULTS), a full
+  per-stream queue `0x8AC81000`; the shim queues one result per command and returns silence for process commands.

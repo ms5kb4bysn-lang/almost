@@ -52,24 +52,32 @@
 // ApuMapApuAddress(u32) -> pointer                                           calls 0x783f6, 0x78485
 //   Returns nullptr for an id the shim did not hand out; both measured sites test for null and skip their copy.
 //
-// XApuConnect(queue_a, queue_b, void** out_handle) -> HRESULT                call 0x43aee69
-//   rcx = 0x9ae9890, rdx = 0x9ae98a8 (two queue descriptors) and r8 = 0x9ae8960. 0x9ae8960 is the handle every other
-//   xapu call reads (Disconnect 0x43ae924, Enqueue sites, GetResultCount/Dequeue 0x4eaa849/0x4eaa890), so the third
-//   argument is the out handle. The shim writes a static dummy handle there and returns S_OK.
-//   The second argument is also written: its first qword is read as the command-buffer base at 0x4e64b45, 0x4f20afe
-//   and 0x4f20b64, the init at 0x5a8797c zeroes it and no other direct write in the image was found, so connect is the
-//   likely filler. The shim stores a zeroed 0x200000-byte block there (0x14000 + 0xff * 0x1e00 = 0x1f4000 is the
-//   largest offset the title computes). Hypothesis: that this slot is a connect out structure; the buffer itself is
-//   only ever memcpy'd into by the title and passed back in commands, which this shim drops.
+// XApuConnect(input*, output*, handle**) -> HRESULT                            call 0x43aee69
+//   input is the 24-byte block at RVA 0x9ae9890: process=1, streams=0x100, commands_per_stream=2, memory=0x104,
+//   frames_per_output=0, options=1 (so no result event is created). The memory field is 4 KiB pages (0x104000 bytes);
+//   the title's buffer arithmetic at 0x4e64b97 / 0x4f20b71 reaches 0x14000 + stream * 0x1e00, so the block must be
+//   that size. output at 0x9ae98a8 is {void* memory; HANDLE result_event}; the title reads memory at +0. The third
+//   argument is the out handle (0x9ae8960), which every other xapu call reads. Each connect is a separate object.
 //
 // XApuDisconnect(handle, 0x20) -> HRESULT                                    call 0x43ae930
-//   Also frees the dummy command buffer the connect above allocated.
-// XApuEnqueueCommand(handle, command*, 0) -> HRESULT                         calls 0x4ee9978, 0x4f2092d, 0x4f20bb8, 0x483d5
+//   Closes the result event, frees the connect memory and destroys the connection.
+//
+// XApuEnqueueCommand(handle, command*, u32* total) -> HRESULT                 calls 0x4ee9978, 0x4f2092d, 0x4f20bb8, 0x483d5
 // XApuDequeueResult(handle, result*) -> HRESULT                              call 0x4eaa89a, negative result tested
-// XApuGetResultCount(handle) -> uint32                                       call 0x4eaa86b
-//   The command queue is connected once and torn down once. The shim accepts every command and reports no results:
-//   GetResultCount returns 0, so the dequeue loop exits without calling DequeueResult; DequeueResult itself returns
-//   S_FALSE (1, non-negative) and writes nothing if it is called anyway.
+// XApuGetResultCount(handle, u32* total) -> uint32                           call 0x4eaa86b
+//   Commands start with a 24-byte packed id {kind, stream, sequence, options, context}; process commands are 0x40
+//   bytes and results 0x50. The shim keeps a per-stream queue bounded by commands_per_stream and a FIFO of results:
+//   - enqueue validates stream < streams and the per-stream queue, then queues one result per command. Activate,
+//     deactivate, notify and reset echo the id with S_OK. Process echoes the command's input/output pointers and
+//     input_length, with frames and output_length zero: there is no Opus decoder, so the result is valid silence.
+//     Invalid kinds return 0x8AC81002, an invalid stream 0x8AC81003, a full per-stream queue 0x8AC81000.
+//   - *total receives the running accepted-command count when non-null.
+//   - dequeue pops the FIFO and writes the packed 0x50-byte result; when empty it returns 0x8AC81001
+//     (PENDING_RESULTS), the value the title polls for. GetResultCount returns the queued count and writes the
+//     dequeued total.
+//   The packed sizes and offsets are the public VIctory fork's facts and are checked against the title: the command
+//   builders above and the result consumer at 0x4eaa8a3 read id.kind at +0, id.stream at +4 and output_length at
+//   +0x34. No audio is decoded; every process result is silence.
 //
 // XDspConnectWithMaximumStreamLimit(a, b, c, 0x80, 1, context) -> int         call 0x5b5262e
 //   Six arguments; the call compares the result with 0 and treats 0 as success (sete). 0 is returned.
@@ -88,12 +96,16 @@
 #include <array>
 #include <atomic>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <mutex>
+#include <new>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "shims.h"
 
@@ -113,13 +125,109 @@ std::unordered_map<void*, size_t> g_apu_blocks;  // exact base -> size
 std::unordered_map<const void*, uint32_t> g_virtual_to_apu;
 std::unordered_map<uint32_t, void*> g_apu_to_virtual;
 uint32_t g_next_apu_id = kFirstApuId;
-uint8_t g_xapu_handle[0x100] = {};  // opaque dummy; the title only stores and passes the pointer
-// The title reads its xapu command-buffer base from the second XApuConnect argument (0x9ae98a8), as a qword at +0,
-// at 0x4e64b45, 0x4f20afe and 0x4f20b64. Its init at 0x5a8797c zeroes that qword and no other direct write was found,
-// so connect is the likely writer. 0x200000 covers the largest offset the title computes:
-// 0x14000 + 0xff * 0x1e00 (256 streams, the count written at 0x5a87a4d) = 0x1f4000.
-constexpr size_t kXapuCommandBufferSize = 0x200000;
-void* g_xapu_command_buffer = nullptr;
+
+// ---- xapu: the title's command/result ABI ----------------------------------------------------------------
+//
+// The title's connect input is the 24-byte block at RVA 0x9ae9890: process=1, streams=0x100,
+// commands_per_stream=2, memory=0x104, frames_per_output=0, options=1. The memory field is 4 KiB pages there:
+// 0x104 << 12 = 0x104000 bytes, the size its buffer arithmetic needs. Callers that already pass bytes (0x1000 or
+// more) are taken literally. The connect output at 0x9ae98a8 is {void* memory; HANDLE event}; the title reads the
+// memory pointer at +0 (0x4e64b45, 0x4f20afe, 0x4f20b64).
+//
+// Commands and results are the packed layouts the title builds at 0x4ee9945 / 0x4f2091d / 0x4f20b7e and reads at
+// 0x4eaa8a3: a 24-byte CommandId (kind, stream, sequence, options, context), a 0x40-byte process command, and a
+// 0x50-byte result. The public VIctory fork documents the same sizes (facts only); the result offsets below are
+// asserted at compile time and checked against the title's reads.
+constexpr HRESULT kXapuQueueFull = static_cast<HRESULT>(0x8AC81000u);
+constexpr HRESULT kXapuPendingResults = static_cast<HRESULT>(0x8AC81001u);
+constexpr HRESULT kXapuInvalidCommand = static_cast<HRESULT>(0x8AC81002u);
+constexpr HRESULT kXapuInvalidStream = static_cast<HRESULT>(0x8AC81003u);
+
+constexpr uint32_t kXapuDecodeOpus = 1;
+constexpr uint32_t kXapuActivate = 1;
+constexpr uint32_t kXapuDeactivate = 2;
+constexpr uint32_t kXapuProcess = 3;
+constexpr uint32_t kXapuNotify = 4;
+constexpr uint32_t kXapuReset = 5;
+constexpr uint32_t kXapuSignalOption = 1;      // command options: signal the result event
+constexpr uint32_t kXapuResultEventOption = 8; // connect options: create output.result_event
+constexpr size_t kXapuMinMemory = 0x10000;      // a zero memory field still gets a usable buffer
+constexpr size_t kXapuPageShift = 12;
+constexpr size_t kXapuPageThreshold = 0x1000;   // below this the title's memory field is pages
+constexpr size_t kXapuMaxMemory = 0x40000000u;  // 1 GiB cap for an unmeasured garbage size
+
+#pragma pack(push, 1)
+struct XApuCommandId {
+    uint32_t kind;
+    uint32_t stream;
+    uint32_t sequence;
+    uint32_t options;
+    uint64_t context;
+};
+struct XApuConnectInput {
+    uint32_t process;
+    uint32_t streams;
+    uint32_t commands_per_stream;
+    uint32_t memory;
+    uint32_t frames_per_output;
+    uint32_t options;
+};
+struct XApuConnectOutput {
+    void* memory;
+    HANDLE result_event;
+};
+struct XApuProcessCommand {
+    XApuCommandId id;
+    float pitch_ramp;
+    float target_pitch;
+    uint32_t first_frame;
+    uint32_t frame_count;
+    uint32_t input_length;
+    const uint8_t* input;
+    uint32_t output_length;
+    uint8_t* output;
+};
+struct XApuResult {
+    XApuCommandId id;
+    uint32_t state;
+    uint64_t state_data;
+    uint64_t usec;
+    HRESULT error;
+    uint32_t frames;
+    uint32_t output_length;
+    uint8_t* output;
+    float pitch;
+    uint32_t input_length;
+    const uint8_t* input;
+};
+#pragma pack(pop)
+static_assert(sizeof(XApuCommandId) == 0x18, "the title's command id is 24 bytes (4 dwords + a qword)");
+static_assert(sizeof(XApuConnectInput) == 0x18, "six 32-bit connect fields");
+static_assert(sizeof(XApuConnectOutput) == 0x10, "memory pointer and result event");
+static_assert(sizeof(XApuProcessCommand) == 0x40, "the process command built at 0x4f20b7e is 0x40 bytes");
+static_assert(sizeof(XApuResult) == 0x50, "the result the title reads at 0x4eaa8a3 is 0x50 bytes");
+static_assert(offsetof(XApuResult, state) == 0x18 && offsetof(XApuResult, state_data) == 0x1c &&
+                  offsetof(XApuResult, usec) == 0x24 && offsetof(XApuResult, error) == 0x2c &&
+                  offsetof(XApuResult, frames) == 0x30 && offsetof(XApuResult, output_length) == 0x34 &&
+                  offsetof(XApuResult, output) == 0x38 && offsetof(XApuResult, pitch) == 0x40 &&
+                  offsetof(XApuResult, input_length) == 0x44 && offsetof(XApuResult, input) == 0x48,
+              "packed result offsets");
+
+struct XApuConnection {
+    void* memory = nullptr;
+    size_t memory_size = 0;
+    HANDLE result_event = nullptr;
+    uint32_t streams = 0;
+    uint32_t commands_per_stream = 0;
+    uint32_t frames_per_output = 0;
+    uint32_t options = 0;
+    std::vector<uint32_t> queued;   // per stream
+    std::deque<XApuResult> results; // FIFO of undelivered results
+    uint32_t commands = 0;
+    uint32_t dequeued = 0;
+};
+std::mutex g_xapu_mutex;
+std::unordered_set<XApuConnection*> g_xapu_connections;
 
 struct ApuHeap {
     uint32_t bytes;
@@ -343,61 +451,209 @@ void* __stdcall ApuMapApuAddress(uint32_t id) {
 
 // ---- xapu command queue -----------------------------------------------------------------------------------------
 
-HRESULT __stdcall XApuConnect(void* queue_a, void* queue_b, void** out_handle) {
+XApuConnection* find_xapu_connection_locked(void* handle) {
+    if (!handle) return nullptr;
+    const auto it = g_xapu_connections.find(static_cast<XApuConnection*>(handle));
+    return it == g_xapu_connections.end() ? nullptr : *it;
+}
+
+HRESULT __stdcall XApuConnect(const void* input_ptr, void* output_ptr, void** out_handle) {
     static std::atomic<bool> logged{false};
     const void* caller = _ReturnAddress();
-    if (!out_handle) return E_POINTER;
+    if (!input_ptr || !output_ptr || !out_handle) return E_INVALIDARG;
 
-    void* buffer = nullptr;
-    {
-        const std::lock_guard lock(g_mutex);
-        if (!g_xapu_command_buffer) g_xapu_command_buffer = alloc_zeroed(kXapuCommandBufferSize);
-        buffer = g_xapu_command_buffer;
+    XApuConnectInput input{};
+    std::memcpy(&input, input_ptr, sizeof(input));
+    if (input.process != kXapuDecodeOpus) return E_NOTIMPL;
+    if (input.streams == 0 || input.streams > 500 || input.commands_per_stream == 0 ||
+        input.commands_per_stream > 16 || input.frames_per_output != 0)
+        return E_INVALIDARG;
+
+    // The title's static input has memory = 0x104, which is 4 KiB pages (0x104000 bytes); its buffer arithmetic
+    // reaches past 0x14000 + stream * 0x1e00. A byte size of 0x1000 or more is taken literally.
+    uint64_t memory_bytes = input.memory;
+    if (memory_bytes != 0 && memory_bytes < kXapuPageThreshold) memory_bytes <<= kXapuPageShift;
+    if (memory_bytes == 0) memory_bytes = kXapuMinMemory;
+    if (memory_bytes > kXapuMaxMemory) return E_INVALIDARG;
+
+    void* memory = alloc_zeroed(static_cast<size_t>(memory_bytes), 16);
+    if (!memory) return E_OUTOFMEMORY;
+
+    HANDLE event = nullptr;
+    if (input.options & kXapuResultEventOption) {
+        event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!event) {
+            const HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+            _aligned_free(memory);
+            return FAILED(hr) ? hr : E_FAIL;
+        }
     }
-    if (!buffer) return E_OUTOFMEMORY;
-    if (queue_b) std::memcpy(queue_b, &buffer, sizeof(buffer));  // see the comment on g_xapu_command_buffer
-    *out_handle = g_xapu_handle;
-    log_once(logged, caller, "XApuConnect(queue_a=%p, queue_b=%p, out=%p) -> S_OK, handle %p, buffer %p", queue_a,
-             queue_b, static_cast<void*>(out_handle), static_cast<void*>(g_xapu_handle), buffer);
+
+    XApuConnection* connection = new (std::nothrow) XApuConnection;
+    if (!connection) {
+        if (event) CloseHandle(event);
+        _aligned_free(memory);
+        return E_OUTOFMEMORY;
+    }
+    connection->memory = memory;
+    connection->memory_size = static_cast<size_t>(memory_bytes);
+    connection->result_event = event;
+    connection->streams = input.streams;
+    connection->commands_per_stream = input.commands_per_stream;
+    connection->frames_per_output = input.frames_per_output;
+    connection->options = input.options;
+    try {
+        connection->queued.assign(input.streams, 0);
+    } catch (...) {
+        if (event) CloseHandle(event);
+        _aligned_free(memory);
+        delete connection;
+        return E_OUTOFMEMORY;
+    }
+
+    {
+        const std::lock_guard lock(g_xapu_mutex);
+        g_xapu_connections.insert(connection);
+    }
+
+    XApuConnectOutput output{memory, event};
+    std::memcpy(output_ptr, &output, sizeof(output));
+    *out_handle = connection;
+    log_once(logged, caller,
+             "XApuConnect(process=%u, streams=%u, commands_per_stream=%u, memory=0x%x/0x%zx bytes, "
+             "frames_per_output=%u, options=0x%x) -> S_OK, memory %p, event %p, handle %p",
+             input.process, input.streams, input.commands_per_stream, input.memory,
+             static_cast<size_t>(memory_bytes), input.frames_per_output, input.options, memory, event,
+             static_cast<void*>(connection));
     return S_OK;
 }
 
 HRESULT __stdcall XApuDisconnect(void* handle, uint32_t flags) {
     static std::atomic<bool> logged{false};
     const void* caller = _ReturnAddress();
-    void* buffer = nullptr;
+    XApuConnection* connection = nullptr;
     {
-        const std::lock_guard lock(g_mutex);
-        buffer = g_xapu_command_buffer;
-        g_xapu_command_buffer = nullptr;
+        const std::lock_guard lock(g_xapu_mutex);
+        connection = find_xapu_connection_locked(handle);
+        if (!connection) return E_INVALIDARG;
+        g_xapu_connections.erase(connection);
     }
-    if (buffer) _aligned_free(buffer);
-    log_once(logged, caller, "XApuDisconnect(handle=%p, flags=0x%x) -> S_OK, freed buffer %p", handle, flags, buffer);
+    const HANDLE event = connection->result_event;
+    void* memory = connection->memory;
+    const size_t memory_size = connection->memory_size;
+    if (event) CloseHandle(event);
+    _aligned_free(memory);
+    delete connection;
+    log_once(logged, caller, "XApuDisconnect(handle=%p, flags=0x%x) -> S_OK, freed memory %p (0x%zx bytes), event %p",
+             handle, flags, memory, memory_size, event);
     return S_OK;
 }
 
-HRESULT __stdcall XApuEnqueueCommand(void* handle, const void* command, uint32_t flags) {
+HRESULT __stdcall XApuEnqueueCommand(void* handle, const void* command_ptr, uint32_t* total) {
     static std::atomic<bool> logged{false};
     const void* caller = _ReturnAddress();
-    log_once(logged, caller, "XApuEnqueueCommand(handle=%p, command=%p, flags=0x%x) -> S_OK (dropped)", handle,
-             command, flags);
+    if (!handle || !command_ptr) return E_INVALIDARG;
+
+    XApuCommandId id{};
+    std::memcpy(&id, command_ptr, sizeof(id));
+
+    size_t queued_after = 0;
+    uint32_t total_after = 0;
+    {
+        const std::lock_guard lock(g_xapu_mutex);
+        XApuConnection* connection = find_xapu_connection_locked(handle);
+        if (!connection) return E_INVALIDARG;
+        if (id.stream >= connection->streams) return kXapuInvalidStream;
+        if (connection->queued[id.stream] >= connection->commands_per_stream) return kXapuQueueFull;
+
+        XApuResult result{};
+        result.id = id;
+        result.error = S_OK;
+        result.pitch = 1.0f;
+        switch (id.kind) {
+            case kXapuActivate:
+            case kXapuDeactivate:
+            case kXapuNotify:
+            case kXapuReset:
+                break;
+            case kXapuProcess: {
+                XApuProcessCommand command{};
+                std::memcpy(&command, command_ptr, sizeof(command));
+                // No Opus decoder: the result is valid but silent. Echo the packet/output buffers the title gave
+                // us, so its consumers keep valid pointers; zero frames and output length mean no PCM was produced.
+                result.input = command.input;
+                result.input_length = command.input_length;
+                result.output = command.output;
+                result.output_length = 0;
+                result.frames = 0;
+                break;
+            }
+            default:
+                return kXapuInvalidCommand;
+        }
+
+        connection->queued[id.stream]++;
+        connection->commands++;
+        connection->results.push_back(result);
+        if (total) *total = connection->commands;
+        if ((id.options & kXapuSignalOption) && connection->result_event) SetEvent(connection->result_event);
+        queued_after = connection->results.size();
+        total_after = connection->commands;
+    }
+
+    log_once(logged, caller,
+             "XApuEnqueueCommand(handle=%p, kind=%u, stream=%u, sequence=%u, options=0x%x, context=0x%llx) -> S_OK, "
+             "queued %zu, total %u",
+             handle, id.kind, id.stream, id.sequence, id.options, static_cast<unsigned long long>(id.context),
+             queued_after, total_after);
     return S_OK;
 }
 
-HRESULT __stdcall XApuDequeueResult(void* handle, void* result) {
+HRESULT __stdcall XApuDequeueResult(void* handle, void* result_ptr) {
     static std::atomic<bool> logged{false};
     const void* caller = _ReturnAddress();
-    log_once(logged, caller, "XApuDequeueResult(handle=%p, result=%p) -> S_FALSE (no result, nothing written)", handle,
-             result);
-    return S_FALSE;
+    if (!handle || !result_ptr) return E_INVALIDARG;
+
+    XApuResult result{};
+    uint32_t kind = 0, stream = 0;
+    size_t left = 0;
+    {
+        const std::lock_guard lock(g_xapu_mutex);
+        XApuConnection* connection = find_xapu_connection_locked(handle);
+        if (!connection) return E_INVALIDARG;
+        if (connection->results.empty()) return kXapuPendingResults;
+        result = connection->results.front();
+        connection->results.pop_front();
+        if (result.id.stream < connection->queued.size()) connection->queued[result.id.stream]--;
+        connection->dequeued++;
+        kind = result.id.kind;
+        stream = result.id.stream;
+        left = connection->results.size();
+    }
+    std::memcpy(result_ptr, &result, sizeof(result));
+    log_once(logged, caller, "XApuDequeueResult(handle=%p, result=%p) -> S_OK, kind=%u stream=%u, %zu left", handle,
+             result_ptr, kind, stream, left);
+    return S_OK;
 }
 
-uint32_t __stdcall XApuGetResultCount(void* handle) {
+uint32_t __stdcall XApuGetResultCount(void* handle, uint32_t* total) {
     static std::atomic<bool> logged{false};
     const void* caller = _ReturnAddress();
-    log_once(logged, caller, "XApuGetResultCount(handle=%p) -> 0", handle);
-    return 0;
+    uint32_t count = 0;
+    uint32_t dequeued = 0;
+    {
+        const std::lock_guard lock(g_xapu_mutex);
+        XApuConnection* connection = find_xapu_connection_locked(handle);
+        if (!connection) return 0;
+        count = static_cast<uint32_t>(connection->results.size());
+        dequeued = connection->dequeued;
+        if (total) *total = dequeued;
+    }
+    log_once(logged, caller, "XApuGetResultCount(handle=%p, total=%p) -> %u queued, %u dequeued", handle,
+             static_cast<void*>(total), count, dequeued);
+    return count;
 }
+
 
 // ---- chad DSP commands ------------------------------------------------------------------------------------------
 
