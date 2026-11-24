@@ -1618,6 +1618,90 @@ HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t
     return static_cast<HRESULT>(static_cast<std::uint32_t>(forward_device<Slot>(self, r1, r2, r3, r4, a5)));
 }
 
+// Device slot 61, CreateSamplerX(const desc* (27 words), CPU handle) (game_scarlett_master.exe at exe+0x12b9818). The
+// console description names the hardware's sampler fields: magnification/minification/mip filters in words 1-3
+// (point 0, bilinear 1, anisotropic point 2, anisotropic bilinear 3; mip none 0, point 1, linear 2), filter mode 5
+// (plain, minimum, maximum), address modes 6-8 (PC values), LOD min/max/bias 9-11 (floats), anisotropy 13, comparison
+// 16 (PC values), border 17-20 (floats). Marvisak/VIctory sampler.rs `console` (facts only; the conversion below is
+// written here). Forwarding it to the PC chain's slot 61 (CreateMetaCommand) wrote a null through a stack word.
+void proxy_create_sampler_x(DeviceProxy* self, const std::uint32_t* w, std::uint64_t handle) {
+    note_slot(61);
+    if (!w || !handle) return;
+    const auto f = [&](int i) {
+        float v;
+        std::memcpy(&v, &w[i], sizeof(v));
+        return v;
+    };
+    const auto linear = [](std::uint32_t filter) { return (filter == 1 || filter == 3) ? 1u : 0u; };
+    const bool aniso = w[1] >= 2 || w[2] >= 2;
+    const bool compares = w[16] >= 2 && w[16] <= 7;  // LESS .. GREATER_EQUAL: a comparison sampler
+    const std::uint32_t reduction = w[5] == 1 ? 2u : w[5] == 2 ? 3u : (compares ? 1u : 0u);
+    const std::uint32_t filter = aniso ? 0x55u : (linear(w[2]) << 4 | linear(w[1]) << 2 | (w[3] == 2 ? 1u : 0u));
+    D3D12_SAMPLER_DESC desc{};
+    desc.Filter = static_cast<D3D12_FILTER>(reduction << 7 | filter);
+    desc.AddressU = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(w[6]);
+    desc.AddressV = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(w[7]);
+    desc.AddressW = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(w[8]);
+    desc.MipLODBias = f(11);
+    desc.MaxAnisotropy = aniso ? std::min<std::uint32_t>(std::max<std::uint32_t>(w[13], 1), 16) : 1;
+    desc.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(std::max<std::uint32_t>(w[16], 1));
+    for (int i = 0; i < 4; ++i) desc.BorderColor[i] = f(17 + i);
+    desc.MinLOD = f(9);
+    desc.MaxLOD = w[3] == 0 ? f(9) : f(10);  // without a mip filter the console samples the first level only
+    self->real->CreateSampler(&desc, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(handle)});
+}
+
+// Device slots 74/75: RegisterPagePoolX(address, page count, u32* index) and UnregisterPagePoolX(index) (VIctory
+// resource.rs, XCL device_x.rs: facts). game_scarlett_master.exe breaks (int3) when 74 fails, at exe+0x1e6c2bb. The
+// pools name 64 KiB pages the title later maps into tiled resources by index, which nothing here does yet; a pool is
+// recorded and handed an index so the title carries on.
+std::mutex g_page_pool_mutex;
+std::vector<std::pair<std::uint64_t, std::uint32_t>> g_page_pools;  // index - 1 -> (address, pages); pages 0: removed
+
+HRESULT proxy_register_page_pool(std::uint64_t address, std::uint64_t pages, std::uint64_t index_out) {
+    note_slot(74);
+    auto* index = reinterpret_cast<std::uint32_t*>(index_out);
+    if (!index || !address || !pages) return E_INVALIDARG;
+    const std::lock_guard lock(g_page_pool_mutex);
+    g_page_pools.emplace_back(address, static_cast<std::uint32_t>(pages));
+    *index = static_cast<std::uint32_t>(g_page_pools.size());
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true))
+        std::fprintf(stderr, "[rt] d3d12_xs: page pool 0x%llx, %llu pages registered (not used by tiled resources yet)\n",
+                     static_cast<unsigned long long>(address), static_cast<unsigned long long>(pages));
+    return S_OK;
+}
+
+HRESULT proxy_unregister_page_pool(std::uint64_t index) {
+    note_slot(75);
+    const std::lock_guard lock(g_page_pool_mutex);
+    if (!index || index > g_page_pools.size() || !g_page_pools[index - 1].second) return E_INVALIDARG;
+    g_page_pools[index - 1].second = 0;
+    return S_OK;
+}
+
+// Device slot 41, CreateCommandSignature(desc, root signature, riid, out): the console's argument type 105 is its
+// DispatchX, a PC Dispatch (game_scarlett_master.exe makes five signatures at exe+0x247954e..0x2479646: draw,
+// indexed, 105, dispatch, mesh; XCL device_x.rs maps 105 the same way, facts only). A failure ends device setup.
+constexpr std::uint32_t kXboxArgumentDispatchX = 105;
+
+HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SIGNATURE_DESC* desc,
+                                       std::uint64_t root, const IID* riid, void** out) {
+    note_slot(41);
+    if (out) *out = nullptr;
+    if (!desc || !riid) return E_INVALIDARG;
+    std::vector<D3D12_INDIRECT_ARGUMENT_DESC> arguments;
+    D3D12_COMMAND_SIGNATURE_DESC pc = *desc;
+    if (desc->pArgumentDescs && desc->NumArgumentDescs <= 64) {
+        arguments.assign(desc->pArgumentDescs, desc->pArgumentDescs + desc->NumArgumentDescs);
+        for (auto& a : arguments)
+            if (static_cast<std::uint32_t>(a.Type) == kXboxArgumentDispatchX) a.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+        pc.pArgumentDescs = arguments.data();
+    }
+    return self->real->CreateCommandSignature(&pc, reinterpret_cast<ID3D12RootSignature*>(unwrap_object(root)), *riid,
+                                              out);
+}
+
 std::atomic<CreateAtAddressFn> g_create_at_address{nullptr};
 std::atomic<CreateHeapAtFn> g_create_heap_at{nullptr};
 std::atomic<CreatePlacedViewFn> g_create_placed_view{nullptr};
@@ -1637,6 +1721,16 @@ void proxy_create_placed_view(DeviceProxy* self, bool unordered, std::uint64_t r
     }
     create(self->real, unordered, reinterpret_cast<const D3D12_RESOURCE_DESC*>(resource),
            reinterpret_cast<const std::uint32_t*>(view), D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(handle)});
+}
+
+// Copies `size` bytes from memory that may not be readable; false (and nothing copied) if it faults.
+bool read_guarded(const void* from, void* to, std::size_t size) {
+    __try {
+        std::memcpy(to, from, size);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
 }
 
 void log_once_placed_heap(HRESULT hr, std::uint64_t address) {
@@ -1665,8 +1759,10 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     bool placed = false;
     if (desc && create_at) {
         std::uint64_t extra[2] = {};
-        std::memcpy(extra, reinterpret_cast<const std::uint8_t*>(desc) + sizeof(D3D12_DESCRIPTOR_HEAP_DESC),
-                    sizeof(extra));
+        // A PC caller's description may end right there: the read past it must not fault.
+        if (!read_guarded(reinterpret_cast<const std::uint8_t*>(desc) + sizeof(D3D12_DESCRIPTOR_HEAP_DESC), extra,
+                          sizeof(extra)))
+            extra[0] = extra[1] = 0;
         const std::uint64_t increment = self->real->GetDescriptorHandleIncrementSize(desc->Type);
         if (extra[0] && increment && extra[1] == std::uint64_t(desc->NumDescriptors) * increment) {
             hr = create_at(self->real, desc, extra[0], __uuidof(ID3D12DescriptorHeap), &created);
@@ -1834,7 +1930,7 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
 // returns that pointer, as the x64 ABI does for a hidden return pointer.
 template <unsigned Slot>
 std::uint64_t proxy_struct_return(std::uint64_t rcx, std::uint64_t rdx, std::uint64_t a2, std::uint64_t a3,
-                                  std::uint64_t a4) {
+                                  std::uint64_t a4, std::uint64_t a5 = 0) {
     DeviceProxy* proxy = nullptr;
     void* out = nullptr;
     if (is_device_proxy(reinterpret_cast<const void*>(rdx))) {
@@ -1852,6 +1948,15 @@ std::uint64_t proxy_struct_return(std::uint64_t rcx, std::uint64_t rdx, std::uin
     } else if constexpr (Slot == 26) {
         *static_cast<D3D12_HEAP_PROPERTIES*>(out) = proxy->real->GetCustomHeapProperties(
             static_cast<UINT>(a2), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(a3)));
+    } else if constexpr (Slot == 108) {
+        // ID3D12Device8::GetResourceAllocationInfo2(mask, count, DESC1s, ALLOCATION_INFO1* or null), called the same
+        // C way (RCX = return buffer, RDX = device) at exe+0xabfda9 and +0xabfe07.
+        ID3D12Device8* device8 = nullptr;
+        if (FAILED(proxy->real->QueryInterface(IID_PPV_ARGS(&device8))) || !device8) return 0;
+        *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(out) = device8->GetResourceAllocationInfo2(
+            static_cast<UINT>(a2), static_cast<UINT>(a3), reinterpret_cast<const D3D12_RESOURCE_DESC1*>(a4),
+            reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO1*>(a5));
+        device8->Release();
     } else {
         static_assert(Slot == 43);
         *static_cast<LUID*>(out) = proxy->real->GetAdapterLuid();
@@ -1900,8 +2005,26 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 32) {
         return hr_to_u64(proxy_open_shared_handle(self, a1, reinterpret_cast<const IID*>(a2),
                                                   reinterpret_cast<void**>(a3)));
-    } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35 || Slot == 45 || Slot == 46 || Slot == 50) {
+    } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35) {
         return hr_to_u64(proxy_unwrapping_call<Slot>(self, a1, a2, a3, a4, a5));
+    } else if constexpr (Slot == 41) {
+        return hr_to_u64(proxy_create_command_signature(self, reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1),
+                                                        a2, reinterpret_cast<const IID*>(a3),
+                                                        reinterpret_cast<void**>(a4)));
+    } else if constexpr (Slot == 61) {
+        proxy_create_sampler_x(self, reinterpret_cast<const std::uint32_t*>(a1), a2);
+        return 0;
+    } else if constexpr (Slot == 74) {
+        return hr_to_u64(proxy_register_page_pool(a1, a2, a3));
+    } else if constexpr (Slot == 75) {
+        return hr_to_u64(proxy_unregister_page_pool(a1));
+    } else if constexpr (Slot == 50 || Slot == 69) {
+        // 50: registers callbacks (game_scarlett_master.exe at exe+0x24745cf, result ignored; HYP a GPU crash-dump
+        // hook); 69: the debug error filter (VIctory). Neither has a PC counterpart: accepted and not called.
+        note_slot(Slot);
+        return hr_to_u64(S_OK);
+    } else if constexpr (Slot == 108) {
+        return proxy_struct_return<108>(reinterpret_cast<std::uint64_t>(self), a1, a2, a3, a4, a5);
     } else if constexpr (Slot == 127) {
         // CreateCommittedResource3 of the enhanced-barrier interfaces: (heap, heap flags, desc1, initial layout,
         // clear, protected session, castable count, castable formats, riid, out); game_scarlett_master.exe makes its
@@ -1922,9 +2045,6 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_at_address(self, a1, a2, a5, a6));
     } else if constexpr (Slot == 25 || Slot == 26 || Slot == 43) {
         return proxy_struct_return<Slot>(reinterpret_cast<std::uint64_t>(self), a1, a2, a3, a4);
-    } else if constexpr (Slot == 75) {
-        return hr_to_u64(proxy_create_command_queue1(self, a1, a2, reinterpret_cast<const IID*>(a3),
-                                                     reinterpret_cast<void**>(a4)));
     } else if constexpr (Slot == 14) {
         return hr_to_u64(proxy_create_descriptor_heap(
             self, reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1),
