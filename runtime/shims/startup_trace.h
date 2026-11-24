@@ -116,7 +116,9 @@ constexpr int kMaxFrames = 16;
 inline std::string stack_from(const CONTEXT& start_context) {
     CONTEXT c = start_context;
     std::string out = "[";
-    for (int i = 0; i < kMaxFrames && c.Rip; ++i) {
+    // The first frame is walked even at RIP 0 (a call through a null pointer): it has no function entry, so the leaf
+    // rule below takes the caller's return address from [rsp].
+    for (int i = 0; i < kMaxFrames && (c.Rip || i == 0); ++i) {
         if (i) out += ',';
         out += quote(where(c.Rip));
         DWORD64 image_base = 0;

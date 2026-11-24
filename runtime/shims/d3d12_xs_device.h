@@ -136,6 +136,13 @@ bool is_allocator_proxy(const void* allocator);
 ID3D12CommandAllocator* allocator_proxy_real_allocator(const void* allocator);
 unsigned allocator_proxy_slot_count(const void* allocator);
 unsigned allocator_proxy_table_size();
+
+// Command lists from CreateCommandListX (device slot 73) come back in a proxy with the console list layout: the PC
+// list at offset 8, then the put pointer and four limits at 0x18..0x40, all zero, so the title's inlined packet writes
+// fall back to method calls, and a zeroed area for the state the title keeps in the list (see the .cpp).
+bool is_list_proxy(const void* list);
+// The wrapped list (no reference added), or null when `list` is not a list proxy.
+ID3D12GraphicsCommandList* list_proxy_real_list(const void* list);
 std::uint64_t allocator_slot_hits(unsigned slot);
 bool allocator_slot_first_call_seen(unsigned slot);
 std::uint64_t allocator_table_overruns();

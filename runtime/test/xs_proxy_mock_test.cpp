@@ -737,11 +737,18 @@ int check_xbox_slots() {
     const IID list_iid = __uuidof(ID3D12GraphicsCommandList);
     void* list = nullptr;
     EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), word(&list))) == S_OK);
-    EXPECT(list && reinterpret_cast<Mock*>(list)->kind == Kind::command_list);
+    // The list comes back in a console-layout proxy around the PC list: put pointer and limits (0x18..0x40) zero.
+    EXPECT(list && xs::is_list_proxy(list));
+    EXPECT(reinterpret_cast<Mock*>(xs::list_proxy_real_list(list))->kind == Kind::command_list);
+    {
+        const auto* header = static_cast<const std::uint64_t*>(list);
+        EXPECT(header[3] == 0 && header[4] == 0 && header[5] == 0 && header[6] == 0 && header[7] == 0);
+    }
     EXPECT(mock->calls[73] == 0 && mock->calls[12] == 1 && xs::device_slot_hits(73) == 1);
     EXPECT(mock->args[12][0] == 0 && mock->args[12][1] == D3D12_COMMAND_LIST_TYPE_DIRECT);
     EXPECT(mock->args[12][2] == word(real_allocator) && mock->args[12][3] == 0);
-    EXPECT(mock->args[12][4] == word(&list_iid));
+    // The PC list is created as ID3D12GraphicsCommandList, whatever the title asked for; the proxy answers that.
+    EXPECT(IsEqualIID(*reinterpret_cast<const IID*>(mock->args[12][4]), __uuidof(ID3D12GraphicsCommandList)));
 
     // Release the list before the refusal calls below: the COM convention (and the handler) nulls the caller's
     // output on failure, so an invalid call would clear this pointer.
