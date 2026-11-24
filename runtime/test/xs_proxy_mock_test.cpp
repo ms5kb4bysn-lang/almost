@@ -656,9 +656,11 @@ int check_allocators() {
         EXPECT(xs::is_allocator_proxy(allocator) && word(xs::allocator_proxy_real_allocator(allocator)) == word(real));
         EXPECT(mock->args[9][0] == D3D12_COMMAND_LIST_TYPE_DIRECT && real->refs == 1);
         EXPECT(xs::allocator_proxy_slot_count(allocator) == 9 && xs::device_proxy_ref_count(device) == device_refs + 1);
-        // Reset (slot 8) reaches the real allocator; every slot past it up to the table end is refused.
+        // Reset (slot 8) reaches the real allocator. Slot 9 is the console's allocation-callback registration and is
+        // accepted without reaching the PC allocator; every slot past it up to the table end is refused.
         EXPECT(hr_of(raw(allocator, 8)) == S_OK && real->calls[8] == 1);
-        for (unsigned slot = 9; slot < xs::allocator_proxy_table_size(); ++slot)
+        EXPECT(hr_of(raw(allocator, 9, 0x1234)) == S_OK && real->calls[9] == 0);
+        for (unsigned slot = 10; slot < xs::allocator_proxy_table_size(); ++slot)
             EXPECT(hr_of(raw(allocator, slot)) == E_NOTIMPL && real->calls[slot] == 0);
         // The tag and the real object stay hidden: QueryInterface answers only the modelled interfaces.
         void* found = reinterpret_cast<void*>(1);
@@ -934,8 +936,9 @@ int check_struct_returns() {
         EXPECT(call(&luid, 43) == word(&luid));
         EXPECT(luid.LowPart == 0x89abcdef && luid.HighPart == 0x1234 && mock->calls[43] == calls43 + 1);
     }
-    // A texture the console layout model knows gets the console's size and alignment, and the PC runtime is not
-    // asked; the zeroed descriptions above are not textures and still go to the PC.
+    // A texture the console layout model knows gets the console's size and alignment; the PC runtime is still asked
+    // first for its capability answer (valid versus UINT64_MAX), and its sizes are replaced. The zeroed descriptions
+    // above are not textures and keep the PC answer.
     D3D12_RESOURCE_DESC texture{};
     texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     texture.Width = 512;
@@ -950,12 +953,12 @@ int check_struct_returns() {
         const unsigned before25 = mock->calls[25];
         EXPECT(raw(device, 25, word(&info), 0, 1, word(&texture)) == word(&info));
         EXPECT(info.SizeInBytes == 0x56000 && info.Alignment == 0x1000);  // the measured console number
-        EXPECT(mock->calls[25] == before25);
+        EXPECT(mock->calls[25] == before25 + 1);  // the PC device answered the capability check
         // Two descriptions add their sizes; the stricter alignment wins.
         D3D12_RESOURCE_DESC pair[] = {texture, texture};
         EXPECT(raw_rcx_first(device, &info, 25, word(device), 0, 2, word(pair)) == word(&info));
         EXPECT(info.SizeInBytes == 2 * 0x56000 && info.Alignment == 0x1000);
-        EXPECT(mock->calls[25] == before25);
+        EXPECT(mock->calls[25] == before25 + 2);
     }
 
     // Neither word a device proxy: 0, the PC device not called, the buffers untouched.
