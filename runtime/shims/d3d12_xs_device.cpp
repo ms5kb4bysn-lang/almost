@@ -1620,6 +1620,24 @@ HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t
 
 std::atomic<CreateAtAddressFn> g_create_at_address{nullptr};
 std::atomic<CreateHeapAtFn> g_create_heap_at{nullptr};
+std::atomic<CreatePlacedViewFn> g_create_placed_view{nullptr};
+
+// Device slots 70/71 (game_scarlett_master.exe 1.0.2.1 calls 70 at six sites through its device global, one
+// returning to exe+0x4ecc821; VIctory
+// device.rs create_placed_srv/uav): the PC chain's slot 70 is ID3D12Device8::CreatePlacedResource1, whose output
+// pointer the title's third word was taken for (an access violation writing into the title's code).
+void proxy_create_placed_view(DeviceProxy* self, bool unordered, std::uint64_t resource, std::uint64_t view,
+                              std::uint64_t handle) {
+    note_slot(unordered ? 71 : 70);
+    const CreatePlacedViewFn create = g_create_placed_view.load(std::memory_order_acquire);
+    if (!create) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) std::fprintf(stderr, "[rt] d3d12_xs: placed views (slots 70/71) have no backend\n");
+        return;
+    }
+    create(self->real, unordered, reinterpret_cast<const D3D12_RESOURCE_DESC*>(resource),
+           reinterpret_cast<const std::uint32_t*>(view), D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(handle)});
+}
 
 void log_once_placed_heap(HRESULT hr, std::uint64_t address) {
     static std::atomic<bool> said{false};
@@ -1782,6 +1800,19 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
     const auto xbox_layout = static_cast<std::uint32_t>(pc_desc.Layout);
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    // Console resource flags above the PC ones (game_scarlett_master.exe 1.0.2.1's back buffers, made through slot
+    // 127, carry some; the PC layer refused them as "resource flags"). Their meaning is not measured: the PC resource
+    // gets the bits the PC defines (0x1-0x400), and the rest are logged once per value.
+    constexpr UINT kPcResourceFlags = 0x7ff;
+    if (const UINT extra = static_cast<UINT>(pc_desc.Flags) & ~kPcResourceFlags) {
+        static std::mutex flags_mutex;
+        static std::set<UINT> seen;
+        const std::lock_guard lock(flags_mutex);
+        if (seen.insert(extra).second)
+            std::fprintf(stderr, "[rt] d3d12_xs: resource (dimension %d) with console flags 0x%x: not on the PC, "
+                         "dropped\n", static_cast<int>(pc_desc.Dimension), extra);
+        pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<UINT>(pc_desc.Flags) & kPcResourceFlags);
+    }
 
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -1871,6 +1902,22 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                   reinterpret_cast<void**>(a3)));
     } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35 || Slot == 45 || Slot == 46 || Slot == 50) {
         return hr_to_u64(proxy_unwrapping_call<Slot>(self, a1, a2, a3, a4, a5));
+    } else if constexpr (Slot == 127) {
+        // CreateCommittedResource3 of the enhanced-barrier interfaces: (heap, heap flags, desc1, initial layout,
+        // clear, protected session, castable count, castable formats, riid, out); game_scarlett_master.exe makes its
+        // back buffers with it (VIctory resource.rs create_committed3, facts only). D3D12_RESOURCE_DESC1 begins with
+        // D3D12_RESOURCE_DESC; the resource starts COMMON, as layouts are not tracked; castable formats are dropped.
+        if (a6) return hr_to_u64(E_INVALIDARG);  // a protected session: none here
+        note_slot(127);
+        return hr_to_u64(proxy_create_resource(
+            self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
+            static_cast<D3D12_HEAP_FLAGS>(static_cast<std::uint32_t>(a2)),
+            reinterpret_cast<const D3D12_RESOURCE_DESC*>(a3), D3D12_RESOURCE_STATE_COMMON,
+            reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a9),
+            reinterpret_cast<void**>(a10)));
+    } else if constexpr (Slot == 70 || Slot == 71) {
+        proxy_create_placed_view(self, Slot == 71, a1, a2, a3);
+        return 0;
     } else if constexpr (Slot == 133) {
         return hr_to_u64(proxy_create_at_address(self, a1, a2, a5, a6));
     } else if constexpr (Slot == 25 || Slot == 26 || Slot == 43) {
@@ -2091,6 +2138,8 @@ bool is_list_proxy(const void* list) { return is_list_proxy_object(list); }
 void set_create_at_address(CreateAtAddressFn fn) { g_create_at_address.store(fn, std::memory_order_release); }
 
 void set_create_heap_at(CreateHeapAtFn fn) { g_create_heap_at.store(fn, std::memory_order_release); }
+
+void set_create_placed_view(CreatePlacedViewFn fn) { g_create_placed_view.store(fn, std::memory_order_release); }
 
 ID3D12GraphicsCommandList* list_proxy_real_list(const void* list) {
     if (!is_list_proxy_object(list)) return nullptr;

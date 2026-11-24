@@ -101,6 +101,11 @@ void set_create_at_address(CreateAtAddressFn fn);
 using CreateHeapAtFn = HRESULT (*)(ID3D12Device* real, const D3D12_DESCRIPTOR_HEAP_DESC* desc, UINT64 address,
                                    REFIID riid, void** out);
 void set_create_heap_at(CreateHeapAtFn fn);
+// Device slots 70/71: a shader resource / unordered access view of memory the title placed itself, (resource
+// description, 16-word console view description, CPU handle). Unset, the slot writes nothing.
+using CreatePlacedViewFn = void (*)(ID3D12Device* real, bool unordered, const D3D12_RESOURCE_DESC* resource,
+                                    const std::uint32_t* view, D3D12_CPU_DESCRIPTOR_HANDLE handle);
+void set_create_placed_view(CreatePlacedViewFn fn);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and

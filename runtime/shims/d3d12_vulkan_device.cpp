@@ -6015,6 +6015,39 @@ public:
     }
 
 public:
+    // Xbox device slots 70/71: a shader resource or unordered access view of memory the title placed itself,
+    // (resource description, view description, CPU handle). The console view description is the PC one (10 words)
+    // followed by the 64-bit address in words 10-11 (Marvisak/VIctory descriptor.rs and descriptor/host.rs, facts
+    // only). A buffer, with the unified arena, becomes a view of a buffer resource at that address (made once per
+    // address and size and kept, as VIctory keeps its placed textures). A texture there is not mirrored yet: its slot
+    // gets a null view of the same kind, said once.
+    void create_placed_view(bool unordered, const D3D12_RESOURCE_DESC& resource_desc, const std::uint32_t* view_words,
+                            D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+        const std::uint64_t address = std::uint64_t(view_words[10]) | std::uint64_t(view_words[11]) << 32;
+        ID3D12Resource* resource = nullptr;
+        if (resource_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && state_.arena.unified && address) {
+            const auto key = std::make_pair(address, resource_desc.Width);
+            std::lock_guard lock(placed_views_mutex_);
+            auto it = placed_view_resources_.find(key);
+            if (it == placed_view_resources_.end()) {
+                void* made = nullptr;
+                D3D12_RESOURCE_DESC desc = resource_desc;
+                desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                if (SUCCEEDED(create_buffer_at_address(address, desc, __uuidof(ID3D12Resource), &made)))
+                    it = placed_view_resources_.emplace(key, static_cast<ID3D12Resource*>(made)).first;
+            }
+            if (it != placed_view_resources_.end()) resource = it->second;
+        } else if (resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+            log_once("placed texture view not mirrored yet (null view); dimension", int(resource_desc.Dimension));
+        }
+        if (unordered)
+            CreateUnorderedAccessView(resource, nullptr,
+                                      reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(view_words), handle);
+        else
+            CreateShaderResourceView(resource, reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view_words),
+                                     handle);
+    }
+
     // A descriptor heap in memory the title allocated for it (the console's heap description carries the address and
     // size; d3d12_xs_device.cpp slot 14). Its CPU start is that address, and for a shader-visible heap (unified arena
     // only) so is its GPU start. E_NOTIMPL when a shader-visible heap cannot be placed there.
@@ -8653,6 +8686,10 @@ private:
     std::atomic<bool> removed_{false};
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
+    // Buffers made for placed views (create_placed_view), by (address, size). Shortcut: kept for the process's life
+    // (each holds the device), as VIctory keeps its placed textures; released once views are tracked per heap slot.
+    std::mutex placed_views_mutex_;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, ID3D12Resource*> placed_view_resources_;
 };
 
 }  // namespace
@@ -8776,11 +8813,20 @@ HRESULT create_descriptor_heap_at(ID3D12Device* device, const D3D12_DESCRIPTOR_H
     return E_NOTIMPL;
 }
 
+void create_placed_view(ID3D12Device* device, bool unordered, const D3D12_RESOURCE_DESC* resource,
+                        const std::uint32_t* view, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    if (!device || !resource || !view || !handle.ptr) return;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (auto* d = Device::from<Device>(real ? real : device)) d->create_placed_view(unordered, *resource, view, handle);
+}
+
 namespace {
-// The proxy's device slots 133 and 14 (a placed heap) reach the layer through their hooks (d3d12_xs_device.h).
+// The proxy's device slots 133, 14 (a placed heap) and 70/71 (placed views) reach the layer through their hooks
+// (d3d12_xs_device.h).
 const bool g_registered_create_at_address = [] {
     rt::d3d12_xs::set_create_at_address(&create_buffer_at_address);
     rt::d3d12_xs::set_create_heap_at(&create_descriptor_heap_at);
+    rt::d3d12_xs::set_create_placed_view(&create_placed_view);
     return true;
 }();
 }  // namespace
