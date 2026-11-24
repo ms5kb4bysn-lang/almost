@@ -2321,9 +2321,20 @@ std::uint64_t proxy_struct_return(std::uint64_t rcx, std::uint64_t rdx, std::uin
         // C way (RCX = return buffer, RDX = device) at exe+0xabfda9 and +0xabfe07.
         ID3D12Device8* device8 = nullptr;
         if (FAILED(proxy->real->QueryInterface(IID_PPV_ARGS(&device8))) || !device8) return 0;
-        *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(out) = device8->GetResourceAllocationInfo2(
+        D3D12_RESOURCE_ALLOCATION_INFO& result = *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(out);
+        result = device8->GetResourceAllocationInfo2(
             static_cast<UINT>(a2), static_cast<UINT>(a3), reinterpret_cast<const D3D12_RESOURCE_DESC1*>(a4),
             reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO1*>(a5));
+        // One texture description gets the console's total, as slot 25 does: the real answer above is the capability
+        // check and the per-resource output; the sizes the title budgets with are the console's. Several descriptions
+        // keep the real total (its per-resource offsets are the PC ones).
+        if (static_cast<UINT>(a3) == 1 && a4 && result.SizeInBytes != UINT64_MAX) {
+            const D3D12_RESOURCE_DESC1& d1 = *reinterpret_cast<const D3D12_RESOURCE_DESC1*>(a4);
+            const D3D12_RESOURCE_DESC d{d1.Dimension, d1.Alignment, d1.Width, d1.Height, d1.DepthOrArraySize,
+                                        d1.MipLevels, d1.Format, d1.SampleDesc, d1.Layout, d1.Flags};
+            D3D12_RESOURCE_ALLOCATION_INFO console{};
+            if (console_allocation_info(1, &d, console)) result = console;
+        }
         device8->Release();
     } else {
         static_assert(Slot == 43);
