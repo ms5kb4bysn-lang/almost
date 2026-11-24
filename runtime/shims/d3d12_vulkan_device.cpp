@@ -1101,11 +1101,17 @@ struct DeviceState {
     // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
         if (!xr_bias_compatible(desc)) return {};
-        if (desc.Format == DXGI_FORMAT_A8_UNORM &&
-            (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
-             (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
-                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))))
-            return {};
+        // A8 is stored as R8_UNORM with an alpha-swizzled SRV. It is a valid render target on the console, so a 2D
+        // single-sample A8 RT is accepted and gets an R8 RTV; the hardware then writes the shader's red channel where
+        // the console writes alpha, so the mask is not yet channel-correct (logged once at the RTV). A8 has no typed
+        // UAV and no depth-stencil use.
+        if (desc.Format == DXGI_FORMAT_A8_UNORM) {
+            if (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+                return {};
+            if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+                (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1))
+                return {};
+        }
         if (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
             if ((desc.SampleDesc.Count != 1 && (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
                                                (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) ||
@@ -6356,7 +6362,11 @@ private:
             const bool typed_bgra8_listed = r && !typed_rgba8 && rgba8_any_order(rd.Format) &&
                                             r->has_castable_formats();
             if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
-                view = {};
+                // An A8 target is an R8_UNORM image here. The console stores the shader's alpha channel and this
+                // backend stores red, so the channel is not emulated yet; the view stays valid so the title has a
+                // render target.
+                log_once("A8 render target stored as R8_UNORM; alpha-to-red channel mapping not emulated; resource",
+                         int(rd.Format));
             } else if (rd.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP ||
                        (desc && desc->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)) {
                 if (rd.Format != DXGI_FORMAT_R9G9B9E5_SHAREDEXP || !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
