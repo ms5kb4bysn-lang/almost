@@ -41,6 +41,8 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 
 namespace rt::d3d12_xs {
@@ -780,7 +782,49 @@ void reset_child_stats() {
 }
 
 // Frees a proxy whose last reference is gone, with the real object and the device reference it held.
+// Fence slot 12 (GetGpuAddress): one 64-byte cell per fence proxy holding its completed value, which a watcher thread
+// refreshes about every millisecond from the real fence. Cells are never freed: the title may keep reading one after
+// it released the fence; a released fence's cell just stops changing.
+#pragma warning(push)
+#pragma warning(disable : 4324)  // padded to its own cache line on purpose
+struct alignas(64) FenceCell {
+    std::atomic<std::uint64_t> value{0};
+};
+#pragma warning(pop)
+std::mutex g_fence_cells_mutex;
+std::unordered_map<ChildProxy*, FenceCell*> g_fence_cells;
+
+void fence_watcher() {
+    for (;;) {
+        {
+            const std::lock_guard lock(g_fence_cells_mutex);
+            for (const auto& [proxy, cell] : g_fence_cells)
+                cell->value.store(reinterpret_cast<ID3D12Fence*>(proxy->real)->GetCompletedValue(),
+                                  std::memory_order_release);
+        }
+        Sleep(1);
+    }
+}
+
+std::uint64_t fence_value_cell(ChildProxy* self) {
+    static std::once_flag started;
+    const std::lock_guard lock(g_fence_cells_mutex);
+    FenceCell*& cell = g_fence_cells[self];
+    if (!cell) {
+        cell = new FenceCell;
+        cell->value.store(reinterpret_cast<ID3D12Fence*>(self->real)->GetCompletedValue(), std::memory_order_release);
+    }
+    std::call_once(started, [] { std::thread(fence_watcher).detach(); });
+    return reinterpret_cast<std::uint64_t>(&cell->value);
+}
+
+void forget_fence_cell(ChildProxy* self) {
+    const std::lock_guard lock(g_fence_cells_mutex);
+    g_fence_cells.erase(self);
+}
+
 void destroy_child(ChildProxy* self) {
+    forget_fence_cell(self);
     IUnknown* real = self->real;
     DeviceProxy* device = self->device;
     delete self;
@@ -1022,6 +1066,61 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                              reinterpret_cast<void**>(a2)));
     } else {
         note_child_slot<K>(Slot);
+        using ChildForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                      std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                      std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                      std::uint64_t, std::uint64_t, std::uint64_t);
+        const auto pc_call = [&](unsigned pc, std::uint64_t b1, std::uint64_t b2) -> std::uint64_t {
+            if (pc >= self->slot_count) return hr_to_u64(E_NOTIMPL);
+            return reinterpret_cast<ChildForwardFn>(self->real_vtable[pc])(self->real, b1, b2, 0, 0, 0, 0, 0, 0, 0, 0,
+                                                                           0, 0, 0, 0);
+        };
+        if constexpr (K == ChildKind::queue && Slot == 10) {
+            // ExecuteCommandLists(count, lists): list proxies (device slot 73) are handed over as their PC lists.
+            UnwrappedArray lists;
+            if (!lists.fill(a2, a1)) return 0;
+            return pc_call(10, a1, lists.data() ? lists.data() : a2);
+        } else if constexpr (K == ChildKind::queue && Slot >= 14) {
+            // The console's newer queue layout (game_scarlett_master.exe): two console methods at 14/15 move the PC's
+            // Signal/Wait/GetTimestampFrequency/GetClockCalibration to 16-19, and more console methods follow
+            // (VIctory queue.rs, XCL queue dispatch: facts; the console slot map). Forwarding 14-18 as PC slots wrote
+            // the timestamp frequency over a fence proxy and a 16-byte GetDesc into an 8-byte stack slot.
+            const auto said = [&](const char* what) {
+                static std::atomic<bool> once{false};
+                if (first_call(once))
+                    std::fprintf(stderr, "[rt] d3d12_xs: queue slot %u (%s) (args 0x%llx 0x%llx 0x%llx 0x%llx)\n", Slot,
+                                 what, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                                 static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+            };
+            if constexpr (Slot == 16 || Slot == 17) {
+                return pc_call(Slot - 2, unwrap_object(a1), a2);  // Signal / Wait(fence, value)
+            } else if constexpr (Slot == 18 || Slot == 19) {
+                return pc_call(Slot - 2, a1, a2);  // GetTimestampFrequency(u64*) / GetClockCalibration(u64*, u64*)
+            } else if constexpr (Slot == 25 || Slot == 34) {
+                return pc_call(14, unwrap_object(a1), a2);  // SignalX(fence, value, flags) / Signal with sync settings
+            } else if constexpr (Slot == 35) {
+                // ExecuteCommandListsX(count, lists, frame token, flags): the title submits all its lists this way.
+                UnwrappedArray lists;
+                if (!lists.fill(a2, a1)) return 0;
+                pc_call(10, a1, lists.data() ? lists.data() : a2);
+                return 0;
+            } else if constexpr (Slot == 32) {
+                said("PresentX: no presenter connected yet, accepted");
+                return hr_to_u64(S_OK);
+            } else if constexpr (Slot == 14 || Slot == 15 || Slot == 23 || Slot == 24 || Slot == 31) {
+                said(Slot == 23 || Slot == 24 ? "suspend/resume, accepted"
+                     : Slot == 31          ? "CopyPageMappingsBatchX, not implemented, accepted"
+                                           : "unknown console method, accepted");
+                return hr_to_u64(S_OK);
+            } else {
+                said("console method not implemented: E_NOTIMPL");
+                return hr_to_u64(E_NOTIMPL);
+            }
+        } else if constexpr (K == ChildKind::fence && Slot == 12) {
+            // GetGpuAddress() -> u64: the address of the completed value, which the title reads and waits on with
+            // monitorx/mwaitx (VIctory fence.rs, XCL fence_x.rs: facts). A 64-byte cell, kept current by a watcher.
+            return fence_value_cell(self);
+        }
         if (Slot >= self->slot_count) {
             bool expected = false;
             if (ChildStats<K>::beyond_warned[Slot].compare_exchange_strong(expected, true,
@@ -1037,7 +1136,6 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             return hr_to_u64(E_NOTIMPL);
         }
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
-        if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
 
         // The PC vtable entry with the real object as `this`; integer/pointer arguments, the hidden struct-return
         // pointer and stack arguments keep their positions, as in the device proxy.
@@ -2094,16 +2192,31 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             return hr_to_u64(proxy_create_command_list_x(self, a1, a2, a3, reinterpret_cast<const IID*>(a4),
                                                          reinterpret_cast<void**>(a5)));
         }
-        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
+        // The console device table is the PC's only up to slot 43; from 44 on it holds the console's own methods,
+        // then the PC Device1..11 methods at other positions (VIctory device.rs, XCL device_x.rs; the console slot
+        // map). A slot here that nothing above answers is not the same-numbered PC method, so it is refused, logged
+        // once with its arguments, instead of forwarded (forwarding wrote through arguments that are not pointers).
+        if constexpr (Slot >= 44) {
+            static std::atomic<bool> said{false};
+            if (first_call(said))
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: device slot %u is a console method not implemented here; E_NOTIMPL (args "
+                             "0x%llx 0x%llx 0x%llx 0x%llx)\n",
+                             Slot, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                             static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+            return hr_to_u64(E_NOTIMPL);
+        } else {
+            if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
 
-        // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
-        // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.
-        using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                 std::uint64_t, std::uint64_t, std::uint64_t);
-        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
-        return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+            // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
+            // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.
+            using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t);
+            auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
+            return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+        }
     }
 }
 

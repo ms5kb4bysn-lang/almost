@@ -394,35 +394,19 @@ int check_levels() {
         EXPECT(hr_of(raw(device, 31, word(fence), 0, GENERIC_ALL, 0, 0)) == S_OK);
         EXPECT(mock->calls[31] == 1 && mock->args[31][0] == real_fence);
 
-        // 45/46: ID3D12Device1
-        const HRESULT r45 = hr_of(raw(device, 45, word(fences), word(values), 2, 0, 0));
-        const HRESULT r46 = hr_of(raw(device, 46, 4, word(objects), word(priorities)));
-        if (l.level >= 1) {
-            EXPECT(r45 == S_OK && mock->calls[45] == 1 && mock->array[45][0] == real_fence &&
-                   mock->array[45][1] == real_fence);
-            EXPECT(r46 == S_OK && mock->calls[46] == 1 && same(mock->array[46], unwrapped, 4));
-        } else {
-            EXPECT(r45 == E_NOTIMPL && r46 == E_NOTIMPL && mock->calls[45] == 0 && mock->calls[46] == 0);
-            void* device1 = nullptr;
-            EXPECT(FAILED(hr_of(raw(device, 0, word(&kDevice1Iid), word(&device1)))) && !device1);
-        }
-        // 50: ID3D12Device3, with the fence argument unwrapped too
-        const HRESULT r50 = hr_of(raw(device, 50, 0, 4, word(objects), word(fence), 1));
-        if (l.level >= 3) {
-            EXPECT(r50 == S_OK && mock->calls[50] == 1 && same(mock->array[50], unwrapped, 4) &&
-                   mock->args[50][3] == real_fence);
-        } else {
-            EXPECT(r50 == E_NOTIMPL && mock->calls[50] == 0);
-        }
-        // 75: ID3D12Device9::CreateCommandQueue1
-        void* queue1 = reinterpret_cast<void*>(1);  // cleared on every failure (bc59ef46's convention)
-        const HRESULT r75 = hr_of(raw(device, 75, word(&kQueueDesc), 0, word(&kQueueIid), word(&queue1)));
-        if (l.level >= 9) {
-            EXPECT(r75 == S_OK && xs::is_queue_proxy(queue1) && mock->calls[75] == 1);
-            EXPECT(release(queue1) == 0 && mock->last_child->refs == 0);
-        } else {
-            EXPECT(r75 == E_NOTIMPL && !queue1 && mock->calls[75] == 0);
-        }
+        // 45/46/50/75 are not the PC's Device1/3/9 methods on the console (its table matches the PC only up to slot
+        // 43; VIctory device.rs, XCL device_x.rs): 45/46 are refused without reaching the device, 50 (a callback
+        // registration) is accepted without reaching it, and 75 is UnregisterPagePoolX (an unknown index is refused).
+        (void)fences;
+        (void)values;
+        (void)priorities;
+        EXPECT(hr_of(raw(device, 45, 0, 0, 2, 0, 0)) == E_NOTIMPL && mock->calls[45] == 0);
+        EXPECT(hr_of(raw(device, 46, 4, word(objects), 0)) == E_NOTIMPL && mock->calls[46] == 0);
+        EXPECT(hr_of(raw(device, 50, 0, 4, word(objects), word(fence), 1)) == S_OK && mock->calls[50] == 0);
+        EXPECT(hr_of(raw(device, 75, 12345)) == E_INVALIDARG && mock->calls[75] == 0);
+        std::uint32_t pool = 0;
+        EXPECT(hr_of(raw(device, 74, 0x10000, 16, word(&pool))) == S_OK && pool != 0 && mock->calls[74] == 0);
+        EXPECT(hr_of(raw(device, 75, pool)) == S_OK && hr_of(raw(device, 75, pool)) == E_INVALIDARG);
 
         Mock* const queue_mock = reinterpret_cast<Mock*>(real_queue);
         Mock* const fence_mock = reinterpret_cast<Mock*>(real_fence);
@@ -430,8 +414,8 @@ int check_levels() {
         EXPECT(queue_mock->refs == 0 && fence_mock->refs == 0);
         EXPECT(release(device) == 0 && mock->refs == 0);
     }
-    std::printf("%s: devices up to ID3D12Device, Device1, Device3, Device9: 44/47/51/76 slots, 45/46/50/75 refused "
-                "without the interface, residency arrays and fences unwrapped otherwise\n", g_label);
+    std::printf("%s: devices up to ID3D12Device, Device1, Device3, Device9: 44/47/51/76 slots; 45/46 refused, 50 "
+                "accepted, 74/75 page pools; residency arrays and fences unwrapped\n", g_label);
     return 0;
 }
 
@@ -863,8 +847,8 @@ int run_env_slots(bool valid) {
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 0);
         EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK && mock->calls[79] == 0);
         EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);
-        // Not an Xbox slot: forwarded (70/71 are the console's placed views, so a slot next to them).
-        EXPECT(hr_of(raw(device, 69)) == S_OK && mock->calls[69] == 1);
+        // A slot the console shares with the PC (0-43): forwarded.
+        EXPECT(hr_of(raw(device, 33)) == S_OK && mock->calls[33] == 1);
     }
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: environment slot overrides %s\n", g_label,
