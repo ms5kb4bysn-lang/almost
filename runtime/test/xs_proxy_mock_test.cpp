@@ -862,7 +862,8 @@ int run_env_slots(bool valid) {
     xs::reset_device_proxy_stats();
     std::uint64_t token = 0;
     if (valid) {
-        // Every route moved: the new slot is handled, the default slot is forwarded to the mock.
+        // Every route moved: the new slot is handled, and the old default (44 or above, answered by nothing else)
+        // is refused rather than forwarded to the PC device.
         EXPECT(hr_of(raw(device, 96, 0, 16667, 1, 0)) == S_OK && mock->calls[96] == 0);
         EXPECT(hr_of(raw(device, 97, 0, 0, 0, 0)) == S_OK && mock->calls[97] == 0);
         EXPECT(hr_of(raw(device, 98, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[98] == 0);
@@ -878,7 +879,7 @@ int run_env_slots(bool valid) {
         const IID list_iid = __uuidof(ID3D12GraphicsCommandList);
         void* list = nullptr;
         EXPECT(hr_of(raw(device, 100, word(&desc), word(allocator), 0, word(&list_iid), word(&list))) == S_OK);
-        EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 1);
+        EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == E_NOTIMPL && mock->calls[78] == 0);
         EXPECT(release(list) == 0);
         EXPECT(release(allocator) == 0);
         EXPECT(release(queue) == 0);
