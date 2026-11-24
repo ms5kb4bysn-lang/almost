@@ -478,6 +478,10 @@ if(BUILD_TESTING)
   add_executable(console_texture_layout_test test/console_texture_layout_test.cpp)
   add_test(NAME console_texture_layout COMMAND console_texture_layout_test)
 
+  # The console CPU's AMD-only instructions (shims/guest_cpu.h), emulated on a host that lacks them.
+  add_executable(guest_cpu_test test/guest_cpu_test.cpp)
+  add_test(NAME guest_cpu COMMAND guest_cpu_test)
+
   add_executable(retire_tickets_test test/retire_tickets_test.cpp)
   add_test(NAME retire_tickets COMMAND retire_tickets_test)
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.

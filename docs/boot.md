@@ -83,6 +83,15 @@ Useful switches:
   problems").
 * `--overlay DIR` sends the guest's writes to a private folder instead of the package.
 
+### Host CPU instructions
+
+The console's CPU is an AMD Zen 2, and the title's compiled code uses AMD-only instructions: an Intel host raises
+`STATUS_ILLEGAL_INSTRUCTION` on the first one. `gta6rt` installs `runtime/shims/guest_cpu.h` before any guest code
+runs. It emulates `CLZERO` (zero the 64-byte line at RAX, which the title uses to clear buffers at
+`game_scarlett_master.exe+0x4e8aa70`) and skips `MONITORX`/`MWAITX` (the fence loop re-reads the completed-value
+cell, so the wait is not needed). `guest_cpu_test` checks both from hand-built machine code; a CPU that has the
+instructions never faults.
+
 ## 3. Triage order
 
 Read the startup trace first; the first event that is not the expected one is the run's first fact.

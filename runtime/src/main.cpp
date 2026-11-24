@@ -33,6 +33,7 @@
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
 #include "../shims/file_system.h"
+#include "../shims/guest_cpu.h"
 #include "../shims/process_shim.h"
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
@@ -153,6 +154,8 @@ int wmain(int argc, wchar_t** argv) {
                                                    : "error: cannot create the trace file\n");
         return 2;
     }
+    // The console CPU is a Zen 2: its code uses CLZERO and MONITORX/MWAITX, which an Intel host raises #UD for.
+    rt::guest_cpu::install();
 
     try {
         rt::Loader loader(game_dir);
