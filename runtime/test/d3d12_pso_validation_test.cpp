@@ -13,10 +13,15 @@
 
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 #if !defined(LEONIDA_TEST_VS_SPV) || !defined(LEONIDA_TEST_PS_SPV) || !defined(LEONIDA_TEST_PS_UINT_SPV) || \
@@ -59,6 +64,82 @@ HRESULT create_graphics(ID3D12Device* dev, const D3D12_GRAPHICS_PIPELINE_STATE_D
 HRESULT create_compute(ID3D12Device* dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc) {
     Ref<ID3D12PipelineState> pso;
     return dev->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso.p));
+}
+
+// Runs `body` with stderr redirected to a file and returns what it wrote (the layer's [rt] lines).
+std::string capture_stderr(const std::function<void()>& body) {
+    char dir[MAX_PATH], path[MAX_PATH];
+    GetTempPathA(MAX_PATH, dir);
+    GetTempFileNameA(dir, "pso", 0, path);
+    std::fflush(stderr);
+    const int saved = _dup(2);
+    int file = -1;
+    _sopen_s(&file, path, _O_RDWR | _O_CREAT | _O_TRUNC | _O_BINARY, _SH_DENYNO, _S_IREAD | _S_IWRITE);
+    _dup2(file, 2);
+    body();
+    std::fflush(stderr);
+    _dup2(saved, 2);
+    _close(saved);
+    _close(file);
+    std::string text;
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "rb") == 0 && f) {
+        char buffer[512];
+        std::size_t n;
+        while ((n = std::fread(buffer, 1, sizeof(buffer), f)) > 0) text.append(buffer, n);
+        std::fclose(f);
+    }
+    std::remove(path);
+    return text;
+}
+
+std::size_t count_text(const std::string& text, const std::string& needle) {
+    std::size_t count = 0;
+    for (std::size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + needle.size()))
+        ++count;
+    return count;
+}
+
+// One pipeline state stream subobject, laid out as d3dx12.h lays it out (type, then the description at pointer
+// alignment). The layer consumes the same bytes through ID3D12Device2::CreatePipelineState.
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename Inner>
+struct alignas(void*) Subobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
+    Inner inner;
+};
+using RootSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*>;
+using VsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE>;
+using PsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE>;
+using TopologySubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                                    D3D12_PRIMITIVE_TOPOLOGY_TYPE>;
+using TargetsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY>;
+
+struct Stream {
+    std::vector<std::uint8_t> bytes;
+    template <typename S>
+    Stream& add(const S& subobject) {
+        static_assert(sizeof(S) % sizeof(void*) == 0);
+        const std::size_t at = bytes.size();
+        bytes.resize(at + sizeof(S));
+        std::memcpy(bytes.data() + at, &subobject, sizeof(S));
+        return *this;
+    }
+    D3D12_PIPELINE_STATE_STREAM_DESC desc() { return {bytes.size(), bytes.data()}; }
+};
+
+D3D12_RT_FORMAT_ARRAY one_target(DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM) {
+    D3D12_RT_FORMAT_ARRAY formats{};
+    formats.RTFormats[0] = format;
+    formats.NumRenderTargets = 1;
+    return formats;
+}
+
+HRESULT create_stream(ID3D12Device* dev, Stream& stream) {
+    Ref<ID3D12Device2> device2;
+    if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&device2.p)))) return E_NOINTERFACE;
+    Ref<ID3D12PipelineState> pso;
+    const D3D12_PIPELINE_STATE_STREAM_DESC desc = stream.desc();
+    return device2->CreatePipelineState(&desc, IID_PPV_ARGS(&pso.p));
 }
 
 }  // namespace
@@ -397,6 +478,14 @@ int main() {
     }));
     EXPECT(check_gfx_parity("gfx: RTVFormats[0]==UNKNOWN with N=1", S_OK, false, false,
                             [](auto& d) { d.RTVFormats[0] = DXGI_FORMAT_UNKNOWN; }));
+    // A8_UNORM is the layer's R8_UNORM (CreateCommittedResource and CreateRenderTargetView map it), so a PSO that
+    // names it as a render target must name R8 rather than be refused; the channel mapping is logged at the RTV.
+    // Layer-only: this is the layer's storage mapping, not a host D3D12 answer.
+    EXPECT(check_gfx_layer_only("gfx: RTVFormats[0]=A8_UNORM (stored as R8)", S_OK,
+                                [](auto& d) { d.RTVFormats[0] = DXGI_FORMAT_A8_UNORM; }));
+    // An unknown format is still refused, not turned into the A8/R8 mapping.
+    EXPECT(check_gfx_layer_only("gfx: RTVFormats[0]=9999 (unknown)", E_INVALIDARG,
+                                [](auto& d) { d.RTVFormats[0] = static_cast<DXGI_FORMAT>(9999); }));
     EXPECT(check_gfx_parity("gfx: NumRenderTargets=9", E_INVALIDARG, false, false,
                             [](auto& d) { d.NumRenderTargets = 9; }));
 
@@ -463,6 +552,49 @@ int main() {
         cs_debug.CS = layer_cs;
         cs_debug.Flags = D3D12_PIPELINE_STATE_FLAG_TOOL_DEBUG;
         EXPECT(create_compute(layer_dev.p, cs_debug) == S_OK);
+        ++checked;
+    }
+
+    // 7. Console pipeline state the layer can honour. The console's rect-list primitive topology type (19) is built
+    // as a triangle PSO, the topology the list proxy already gives a rect-list draw; the mapping is logged once per
+    // value. A stream desc carries it too (the boot's failing call shape). A topology with no path here (PATCH) is
+    // still refused with its log, so the console mapping does not turn into a mask for everything.
+    {
+        auto desc = make_gfx(layer_root.p, layer_vs_fs, layer_ps_unorm);
+        desc.PrimitiveTopologyType = static_cast<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(19);
+        HRESULT hr = E_FAIL;
+        const std::string log = capture_stderr([&] { hr = create_graphics(layer_dev.p, desc); });
+        EXPECT(hr == S_OK);
+        EXPECT(count_text(log, "console rect-list topology type mapped to triangle; type 19") == 1);
+        ++checked;
+
+        Stream stream;
+        stream.add(RootSubobject{.inner = layer_root.p});
+        stream.add(VsSubobject{.inner = layer_vs_fs});
+        stream.add(PsSubobject{.inner = layer_ps_unorm});
+        stream.add(TopologySubobject{.inner = static_cast<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(19)});
+        stream.add(TargetsSubobject{.inner = one_target()});
+        hr = E_FAIL;
+        const std::string again = capture_stderr([&] { hr = create_stream(layer_dev.p, stream); });
+        EXPECT(hr == S_OK);
+        EXPECT(count_text(again, "console rect-list topology type mapped to triangle") == 0);
+        ++checked;
+
+        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+        const std::string patch_log = capture_stderr([&] { hr = create_graphics(layer_dev.p, desc); });
+        EXPECT(hr == E_INVALIDARG);
+        EXPECT(count_text(patch_log, "primitive topology type not supported: 4") == 1);
+        ++checked;
+
+        // The boot's failing call shape: a stream desc naming the A8 target. It creates with the R8 colour format the
+        // resource and its RTV use.
+        Stream a8_stream;
+        a8_stream.add(RootSubobject{.inner = layer_root.p});
+        a8_stream.add(VsSubobject{.inner = layer_vs_fs});
+        a8_stream.add(PsSubobject{.inner = layer_ps_unorm});
+        a8_stream.add(TopologySubobject{.inner = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE});
+        a8_stream.add(TargetsSubobject{.inner = one_target(DXGI_FORMAT_A8_UNORM)});
+        EXPECT(SUCCEEDED(create_stream(layer_dev.p, a8_stream)));
         ++checked;
     }
 

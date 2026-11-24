@@ -884,7 +884,15 @@ The compute path, end to end:
   - **Formats:** dynamic rendering takes the RTV and DSV formats. A draw that leaves a slot unbound for which the
     PSO names a format (D3D12 allows it and discards those writes) uses a variant of the pipeline with that format
     undefined, built on first use and kept with the PSO. Bit i of the variant key is colour slot i, and bit 8 is
-    depth/stencil.
+    depth/stencil. **`DXGI_FORMAT_A8_UNORM`** is the layer's `VK_FORMAT_R8_UNORM` (the resource and its RTV map it;
+    the console stores the shader's alpha channel and this backend red, which is logged at the RTV and not emulated
+    yet), so a PSO naming A8 as a render target is created with the R8 colour format instead of being refused as an
+    unsupported format. **The console's rect-list primitive topology type** (19; the console enum is not published,
+    and 19 is the value the boot's failing PSO uses) is built as a triangle PSO: the list proxy forwards the
+    console's `IASetPrimitiveTopology` value 17 and `vulkan_topology()` maps it to a triangle list,
+    and the PSO's input-assembly topology is dynamic, so the PSO only picks the primitive class it validates against.
+    The mapping is logged once per value. Rect-list pixels need a draw-side expansion (two triangles per four
+    vertices), which is not built yet.
   - **Instance step rate 0:** every instance reads element 0, done with a stride of 0 for that slot at draw time.
   - **Features:** independent blend state, wireframe fill, a depth-bias clamp, SRC1 blend factors, logic ops and
     disabled depth clipping need `independentBlend`, `fillModeNonSolid`, `depthBiasClamp`, `dualSrcBlend`, `logicOp`

@@ -2899,6 +2899,15 @@ bool layout_feeds(const leonida::ShaderEntry& vs, const D3D12_INPUT_LAYOUT_DESC&
 // on both Windows hardware D3D12 and WARP.
 constexpr UINT kKnownPipelineStateFlags = 0xFu;
 
+// The console's D3D12_PRIMITIVE_TOPOLOGY_TYPE has values beyond the PC enum's 0..4; its enum is not published, and
+// the boot creates a PSO with value 19, which this layer treats as the console's rect-list type (the list-side rect
+// list is IASetPrimitiveTopology 17, d3d12_xs_device.cpp list slot 20). A rect list is drawn as a triangle list here:
+// the list proxy forwards 17 and vulkan_topology() maps it to VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, and the PSO's
+// input-assembly topology is dynamic and comes from the list at each draw, so the PSO only picks the primitive class
+// it validates against. Correct rect-list pixels need a draw-side expansion (two triangles per four vertices), which
+// is not built yet.
+constexpr D3D12_PRIMITIVE_TOPOLOGY_TYPE kConsoleTopologyTypeRectList = D3D12_PRIMITIVE_TOPOLOGY_TYPE(19);
+
 class RootSignature final
     : public Child<RootSignature, ID3D12RootSignatureStubs, ID3D12Object, ID3D12DeviceChild, ID3D12RootSignature> {
 public:
@@ -3403,6 +3412,14 @@ public:
             if (rt0.BlendEnable && rt0.LogicOpEnable) return E_INVALIDARG;
             if (rt0.LogicOpEnable && unsigned(rt0.LogicOp) > D3D12_LOGIC_OP_OR_INVERTED) return E_INVALIDARG;
         }
+        // A console rect-list PSO is built as a triangle PSO (kConsoleTopologyTypeRectList): the input assembly is
+        // dynamic and the list's topology 17 already becomes a triangle list, so the two agree. Logged once per value,
+        // as the rest of the console-only mappings are.
+        D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type = desc.PrimitiveTopologyType;
+        if (topology_type == kConsoleTopologyTypeRectList) {
+            log_once("console rect-list topology type mapped to triangle; type", int(topology_type));
+            topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        }
         if (desc.HS.BytecodeLength || desc.DS.BytecodeLength || desc.StreamOutput.NumEntries) {
             log_once("graphics pipeline stage not supported yet (hull/domain/stream output):", 0);
             return E_NOTIMPL;
@@ -3415,8 +3432,8 @@ public:
             log_once("geometry shaders need the Vulkan geometryShader feature; stage", 0);
             return E_NOTIMPL;
         }
-        if (geometry && desc.PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
-            log_once("a translated geometry shader takes triangles; topology type", desc.PrimitiveTopologyType);
+        if (geometry && topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
+            log_once("a translated geometry shader takes triangles; topology type", topology_type);
             return E_INVALIDARG;
         }
         const UINT samples = desc.SampleDesc.Count;
@@ -3678,7 +3695,7 @@ public:
             }
         }
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-        switch (mesh ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE : desc.PrimitiveTopologyType) {  // mesh: not used
+        switch (mesh ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE : topology_type) {  // mesh: not used
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT: assembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
@@ -3705,7 +3722,7 @@ public:
                 return E_INVALIDARG;
             }
             if (r.FillMode != D3D12_FILL_MODE_SOLID ||
-                desc.PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return E_INVALIDARG;
+                topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return E_INVALIDARG;
             // Target-independent rasterization is a separate pipeline path; do not silently ignore its count.
             if (r.ForcedSampleCount) return E_NOTIMPL;
         }
@@ -3817,7 +3834,10 @@ public:
         graphics_.color_formats.assign(desc.NumRenderTargets, VK_FORMAT_UNDEFINED);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             if (desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) continue;
-            graphics_.color_formats[i] = vulkan_format(desc.RTVFormats[i], false).format;
+            // texture_storage_format, not vulkan_format: A8_UNORM is the layer's R8_UNORM with an alpha-swizzled SRV
+            // (CreateCommittedResource and CreateRenderTargetView make it R8 too), so an A8 render-target PSO must
+            // name the R8 colour format its attachments have. The channel mapping itself is logged at the RTV.
+            graphics_.color_formats[i] = texture_storage_format(desc.RTVFormats[i], false).format;
             if (graphics_.color_formats[i] == VK_FORMAT_UNDEFINED) {
                 log_once("render-target format not supported yet:", desc.RTVFormats[i]);
                 return E_INVALIDARG;
